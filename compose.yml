@@ -1,5 +1,6 @@
 services:
   banshee:
+    image: ghcr.io/timkunze96/banshee:main
     build: .
     restart: unless-stopped
     ports:

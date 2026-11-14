@@ -1,0 +1,38 @@
+name: Image
+
+# Publishes the server image to ghcr.io/timkunze96/banshee: `main` on every
+# push to main, plus the version for tags like v0.2.0.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/timkunze96/banshee
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -15,6 +15,9 @@ docker compose up -d
 docker compose logs banshee   # shows the certificate fingerprint
 ```
 
+That pulls the image from `ghcr.io/timkunze96/banshee`; `docker compose up -d
+--build` builds it from the source instead.
+
 It listens on UDP port 7700. Settings are environment variables:
 
 - `BANSHEE_CHANNELS`: channel names, comma separated (default `Lobby,Gaming,AFK`)
@@ -23,6 +26,10 @@ It listens on UDP port 7700. Settings are environment variables:
 
 The server makes its own certificate on first start and keeps it in the data
 volume. Clients pin its fingerprint, so there's no domain or CA needed.
+
+## Connecting with Wisp
+
+Add a bookmark in Wisp with the address `banshee://your-host:7700#fingerprint`.
 
 ## Trying it
 
