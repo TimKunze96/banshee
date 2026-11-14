@@ -108,18 +108,32 @@ impl Client {
     }
 
     pub async fn recv_voice(&self) -> Result<Voice> {
-        loop {
-            let data = self.conn.read_datagram().await?;
-            if let Some(d) = voice::decode_down(&data) {
-                return Ok(Voice { from: d.from, seq: d.seq, opus: d.opus.to_vec() });
-            }
-        }
+        self.voice().recv().await
+    }
+
+    /// Receives voice on its own, so it can be awaited next to `next_event`.
+    pub fn voice(&self) -> VoiceReceiver {
+        VoiceReceiver(self.conn.clone())
     }
 
     /// Leave, and wait until the server has been told.
     pub async fn close(self) {
         self.conn.close(0u32.into(), b"bye");
         self.endpoint.wait_idle().await;
+    }
+}
+
+#[derive(Clone)]
+pub struct VoiceReceiver(quinn::Connection);
+
+impl VoiceReceiver {
+    pub async fn recv(&self) -> Result<Voice> {
+        loop {
+            let data = self.0.read_datagram().await?;
+            if let Some(d) = voice::decode_down(&data) {
+                return Ok(Voice { from: d.from, seq: d.seq, opus: d.opus.to_vec() });
+            }
+        }
     }
 }
 
