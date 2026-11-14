@@ -155,11 +155,13 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>) -> Result<(
     };
     let voice = async {
         loop {
-            let data = conn.read_datagram().await?;
-            relay(&state, id, &data);
+            match conn.read_datagram().await {
+                Ok(data) => relay(&state, id, &data),
+                // the client said goodbye
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => return anyhow::Ok(()),
+                Err(e) => return Err(e.into()),
+            }
         }
-        #[allow(unreachable_code)]
-        anyhow::Ok(())
     };
     let result = tokio::select! {
         r = writer => r,
