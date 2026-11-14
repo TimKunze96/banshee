@@ -1,0 +1,63 @@
+//! Talk to a Banshee server from the terminal: lines are chat, `/join <id>`
+//! changes channel, `/quit` leaves.
+//!
+//! banshee-cli <host:port> <name> [fingerprint]
+
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use banshee_client::{Client, ServerMsg};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [addr, name, rest @ ..] = args.as_slice() else {
+        eprintln!("usage: banshee-cli <host:port> <name> [fingerprint]");
+        std::process::exit(2);
+    };
+    let addr = tokio::net::lookup_host(addr).await?.next().context("no address for that host")?;
+    let mut client = Client::connect(addr, name, rest.first().map(String::as_str)).await?;
+    println!("connected, server fingerprint {}", client.fingerprint);
+    for c in &client.channels {
+        println!("  channel {}: {}", c.id, c.name);
+    }
+    let mut names: HashMap<u32, String> = client.users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        tokio::select! {
+            line = stdin.next_line() => {
+                let Some(line) = line? else { break };
+                match line.split_once(' ') {
+                    Some(("/join", id)) => match id.trim().parse() {
+                        Ok(id) => client.join(id),
+                        Err(_) => println!("/join takes a channel id"),
+                    },
+                    _ if line.trim() == "/quit" => break,
+                    _ if line.trim().is_empty() => {}
+                    _ => client.chat(&line),
+                }
+            }
+            event = client.next_event() => {
+                let Some(event) = event else { println!("disconnected"); break };
+                let name = |id: u32| names.get(&id).cloned().unwrap_or_else(|| format!("#{id}"));
+                match event {
+                    ServerMsg::UserJoined(u) => {
+                        println!("{} joined", u.name);
+                        names.insert(u.id, u.name);
+                    }
+                    ServerMsg::UserLeft { id } => {
+                        println!("{} left", name(id));
+                        names.remove(&id);
+                    }
+                    ServerMsg::UserMoved { id, channel } => println!("{} moved to channel {channel}", name(id)),
+                    ServerMsg::Chat { from, text, .. } => println!("<{}> {text}", name(from)),
+                    ServerMsg::Error { message } => println!("error: {message}"),
+                    ServerMsg::Welcome { .. } => {}
+                }
+            }
+        }
+    }
+    client.close().await;
+    Ok(())
+}
