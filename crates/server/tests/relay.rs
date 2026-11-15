@@ -152,6 +152,18 @@ async fn keeps_certificate_roles_and_channels() {
 }
 
 #[tokio::test]
+async fn connecting_again_replaces_the_old_connection() {
+    let s = start("replace", false).await;
+    let id = Identity::generate();
+    let mut old = connect(&s, "A", &id).await.unwrap();
+    let new = connect(&s, "A", &id).await.unwrap();
+    let gone = ServerMsg::UserLeft { id: old.you, reason: Leave::Replaced };
+    assert_eq!(wait_for(&mut old, |e| matches!(e, ServerMsg::UserLeft { .. })).await, gone);
+    assert_eq!(new.users.len(), 1);
+    assert_eq!(new.users[0].name, "A", "the name is free again");
+}
+
+#[tokio::test]
 async fn members_cant_moderate() {
     let s = start("members", false).await;
     let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();

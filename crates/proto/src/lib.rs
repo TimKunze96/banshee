@@ -358,6 +358,8 @@ pub enum Leave {
         by: UserId,
         reason: String,
     },
+    /// The same identity connected again (after a network change, say).
+    Replaced,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

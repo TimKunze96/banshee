@@ -186,8 +186,10 @@ impl State {
         if self.store.max_users.is_some_and(|m| self.users.len() >= m as usize) && !self.role(role).can(Perm::JoinAny) {
             return Err("the server is full".into());
         }
-        if self.users.values().any(|p| p.user.key == a.key) {
-            return Err("you're already connected with this identity".into());
+        // most likely the old connection died and we haven't noticed yet
+        let old: Vec<UserId> = self.users.values().filter(|p| p.user.key == a.key).map(|p| p.user.id).collect();
+        for id in old {
+            self.remove(id, Leave::Replaced);
         }
 
         let name = self.free_name(name, None);
