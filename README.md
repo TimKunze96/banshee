@@ -54,7 +54,8 @@ cargo run -p banshee-client --bin banshee-cli -- 127.0.0.1:7700 yourname <finger
 ```
 
 Lines you type are chat, `/join <id>` switches channel, `/redeem <token>`
-uses a token, `/quit` leaves. Its identity is kept in `banshee-identity.der`.
+uses a token, `/avatar <file>` sets a picture, `/quit` leaves. Its identity
+is kept in `banshee-identity.der`.
 
 ## Layout
 

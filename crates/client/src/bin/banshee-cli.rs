@@ -1,5 +1,6 @@
 //! Talk to a Banshee server from the terminal: lines are chat, `/join <id>`
-//! changes channel, `/redeem <token>` uses a token, `/quit` leaves. The
+//! changes channel, `/redeem <token>` uses a token, `/avatar <file>` sets a
+//! picture, `/quit` leaves. The
 //! identity lives in `banshee-identity.der` in the current directory.
 //!
 //! banshee-cli <host:port> <name> [fingerprint]
@@ -35,6 +36,13 @@ async fn main() -> Result<()> {
                     Some(("/join", id)) => match id.trim().parse() {
                         Ok(id) => client.join(id),
                         Err(_) => println!("/join takes a channel id"),
+                    },
+                    Some(("/avatar", file)) => match std::fs::read(file.trim()) {
+                        Ok(data) => match client.files().set_avatar(&data).await {
+                            Ok(()) => println!("picture set"),
+                            Err(e) => println!("error: {e:#}"),
+                        },
+                        Err(e) => println!("can't read {file}: {e}"),
                     },
                     Some(("/redeem", token)) => client.send(ClientMsg::Redeem { token: token.trim().into() }),
                     _ if line.trim() == "/quit" => break,
