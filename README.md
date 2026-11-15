@@ -22,7 +22,7 @@ docker compose logs banshee   # shows the certificate fingerprint and admin toke
 ```
 
 On first start the server prints a token. Whoever redeems it becomes admin
-(in Wisp: "Use privilege key"), and it's gone after that.
+(in Wisp: admin window, Privilege keys, Use key), and it's gone after that.
 
 That pulls the image from `ghcr.io/timkunze96/banshee`; `docker compose up -d
 --build` builds it from the source instead.
