@@ -54,6 +54,8 @@ pub struct ServerInfo {
     pub welcome: String,
     pub max_users: Option<u32>,
     pub has_password: bool,
+    /// The role new people get.
+    pub default_role: RoleId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

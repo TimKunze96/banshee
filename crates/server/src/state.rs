@@ -80,6 +80,7 @@ impl State {
             welcome: self.store.welcome.clone(),
             max_users: self.store.max_users,
             has_password: self.store.password.is_some(),
+            default_role: self.store.default_role,
         }
     }
 
