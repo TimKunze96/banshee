@@ -193,7 +193,15 @@ impl Db {
         {
             let db = Db::borrowed(&tx);
             for r in &old.roles {
-                db.save_role(r)?;
+                // files are new: whoever could make channels gets to share them
+                let mut r = r.clone();
+                if r.can(Perm::CreateTempChannels) || r.can(Perm::ManageChannels) {
+                    r.perms.push(Perm::UploadFiles);
+                }
+                if r.can(Perm::ManageChannels) {
+                    r.perms.push(Perm::ManageFiles);
+                }
+                db.save_role(&r)?;
             }
             for (key, a) in &old.accounts {
                 tx.execute(
@@ -653,7 +661,7 @@ mod tests {
         let json = serde_json::json!({
             "name": "Old", "welcome": "hi", "max_users": null, "password": null,
             "channels": [{"id": 7, "parent": null, "name": "Lobby", "password": null, "max_users": null, "default": true}],
-            "roles": [{"id": 1, "name": "Admin", "rank": 100, "perms": ["Kick"], "talk_power": 100}],
+            "roles": [{"id": 1, "name": "Admin", "rank": 100, "perms": ["ManageChannels"], "talk_power": 100}],
             "default_role": 1,
             "accounts": {key.clone(): {"name": "A", "role": 1, "last_seen": 5}},
             "bans": [], "tokens": [], "next_channel": 8, "next_role": 2, "next_ban": 1
@@ -662,6 +670,7 @@ mod tests {
         let db = Db::open(&d, &[]).unwrap();
         assert_eq!(db.settings().unwrap().name, "Old");
         assert_eq!(db.channels().unwrap()[0].id, 7);
+        assert_eq!(db.roles().unwrap()[0].perms, [Perm::ManageChannels, Perm::UploadFiles, Perm::ManageFiles]);
         assert_eq!(db.account(&parse_key(&key).unwrap()).unwrap().unwrap().role, 1);
         assert!(d.join("state.json.imported").exists());
     }
