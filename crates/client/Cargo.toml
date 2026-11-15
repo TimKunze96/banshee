@@ -11,6 +11,7 @@ anyhow = "1.0.104"
 banshee-proto = { version = "0.1.0", path = "../proto" }
 bytes = "1.12.1"
 quinn = "0.11.12"
+ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-std", "io-util"] }
