@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use banshee_proto::{
-    Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, Key, Leave, NewChannel, Perm, Role, RoleId, ServerEdit,
-    ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex,
+    Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, Key, Leave, NewChannel, Perm, Role, RoleId,
+    ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::store::{self, Store, StoredAccount, StoredBan, StoredChannel, check_password, hash_password, now};
+use crate::db::{self, Db, Settings, StoredChannel, check_password, hash_password, now};
+use crate::files;
 
 pub const MAX_NAME: usize = 32;
 const MAX_CHAT: usize = 2000;
@@ -21,8 +22,11 @@ const MAX_SHORT: usize = 200;
 const MAX_WHISPER: usize = 64;
 
 pub struct State {
-    pub store: Store,
-    data_dir: PathBuf,
+    pub db: Db,
+    pub data_dir: PathBuf,
+    settings: Settings,
+    roles: Vec<Role>,
+    next_channel: ChannelId,
     /// Sibling order is the order in here.
     channels: Vec<Chan>,
     pub users: HashMap<UserId, Peer>,
@@ -55,32 +59,54 @@ pub struct Arrival {
 type Outcome = Result<(), String>;
 
 impl State {
-    pub fn new(store: Store, data_dir: PathBuf) -> Self {
-        let channels = store.channels.iter().map(|c| Chan { c: c.clone(), permanent: true }).collect();
-        let mut s = Self { store, data_dir, channels, users: HashMap::new(), next_user: 1 };
+    pub fn new(db: Db, data_dir: PathBuf) -> anyhow::Result<Self> {
+        let channels: Vec<Chan> = db.channels()?.into_iter().map(|c| Chan { c, permanent: true }).collect();
+        if channels.is_empty() {
+            anyhow::bail!("the server has no channels");
+        }
+        let mut s = Self {
+            settings: db.settings()?,
+            roles: db.roles()?,
+            next_channel: db.next_channel()?,
+            db,
+            data_dir,
+            channels,
+            users: HashMap::new(),
+            next_user: 1,
+        };
         if !s.channels.iter().any(|c| c.c.default) {
             s.channels[0].c.default = true;
         }
-        if s.store.prune_bans() {
-            s.save();
-        }
-        s
+        Ok(s)
     }
 
-    pub fn save(&mut self) {
-        self.store.channels = self.channels.iter().filter(|c| c.permanent).map(|c| c.c.clone()).collect();
-        if let Err(e) = self.store.save(&self.data_dir) {
-            warn!("couldn't save the server state: {e:#}");
+    /// Keep the permanent channels.
+    fn save_channels(&mut self) {
+        let keep: Vec<StoredChannel> = self.channels.iter().filter(|c| c.permanent).map(|c| c.c.clone()).collect();
+        if let Err(e) = self.db.save_channels(&keep) {
+            warn!("couldn't save the channels: {e:#}");
         }
+    }
+
+    /// Something for the server log.
+    fn log(&self, text: String) {
+        info!("{text}");
+        if let Err(e) = self.db.log(&text) {
+            warn!("couldn't write the log: {e:#}");
+        }
+    }
+
+    pub fn admin_token(&self) -> Option<String> {
+        self.db.unused_admin_token().ok().flatten()
     }
 
     pub fn info(&self) -> ServerInfo {
         ServerInfo {
-            name: self.store.name.clone(),
-            welcome: self.store.welcome.clone(),
-            max_users: self.store.max_users,
-            has_password: self.store.password.is_some(),
-            default_role: self.store.default_role,
+            name: self.settings.name.clone(),
+            welcome: self.settings.welcome.clone(),
+            max_users: self.settings.max_users,
+            has_password: self.settings.password.is_some(),
+            default_role: self.settings.default_role,
         }
     }
 
@@ -107,7 +133,8 @@ impl State {
 
     fn role(&self, id: RoleId) -> &Role {
         static NOBODY: Role = Role { id: 0, name: String::new(), rank: 0, perms: Vec::new(), talk_power: 0 };
-        self.store.role(id).or_else(|| self.store.role(self.store.default_role)).unwrap_or(&NOBODY)
+        let find = |id| self.roles.iter().find(|r| r.id == id);
+        find(id).or_else(|| find(self.settings.default_role)).unwrap_or(&NOBODY)
     }
 
     fn role_of(&self, id: UserId) -> &Role {
@@ -129,6 +156,10 @@ impl State {
         } else {
             Err("they rank the same as you or higher".into())
         }
+    }
+
+    fn known_role(&self, id: RoleId) -> Result<&Role, String> {
+        self.roles.iter().find(|r| r.id == id).ok_or_else(|| "no such role".into())
     }
 
     fn user(&self, id: UserId) -> Result<&User, String> {
@@ -167,23 +198,24 @@ impl State {
         if name.is_empty() || name.chars().count() > MAX_NAME {
             return Err(format!("names need 1 to {MAX_NAME} characters"));
         }
-        if self.store.prune_bans() {
-            self.save();
-        }
-        if let Some(ban) = self.store.ban_for(&a.key, &a.ip) {
+        if let Some(ban) = stored(self.db.ban_for(&a.key, &a.ip))? {
             let until = match ban.until {
                 Some(u) => format!(" for {} more minutes", (u.saturating_sub(now()) / 60).max(1)),
                 None => String::new(),
             };
             return Err(format!("you're banned{until}: {}", ban.reason));
         }
-        if let Some(stored) = &self.store.password
-            && !a.password.as_deref().is_some_and(|p| check_password(stored, p))
+        if let Some(hash) = &self.settings.password
+            && !a.password.as_deref().is_some_and(|p| check_password(hash, p))
         {
             return Err("wrong server password".into());
         }
-        let role = self.store.account(&a.key).map(|acc| acc.role).unwrap_or(self.store.default_role);
-        if self.store.max_users.is_some_and(|m| self.users.len() >= m as usize) && !self.role(role).can(Perm::JoinAny) {
+        let account = stored(self.db.account(&a.key))?;
+        let role = account.as_ref().map(|acc| acc.role).unwrap_or(self.settings.default_role);
+        let avatar = account.and_then(|acc| acc.avatar);
+        if self.settings.max_users.is_some_and(|m| self.users.len() >= m as usize)
+            && !self.role(role).can(Perm::JoinAny)
+        {
             return Err("the server is full".into());
         }
         // most likely the old connection died and we haven't noticed yet
@@ -193,14 +225,8 @@ impl State {
         }
 
         let name = self.free_name(name, None);
-        let entry = self.store.accounts.entry(key_hex(&a.key)).or_insert(StoredAccount {
-            name: name.clone(),
-            role,
-            last_seen: 0,
-        });
-        entry.name = name.clone();
-        entry.last_seen = now();
-        self.save();
+        stored(self.db.touch_account(&a.key, &name, role))?;
+        let unread = self.db.inbox(&a.key).map(|m| m.iter().filter(|m| !m.read).count()).unwrap_or(0);
 
         let id = self.next_user;
         self.next_user += 1;
@@ -217,17 +243,25 @@ impl State {
             server_muted: false,
             talk_granted: false,
             talk_request: None,
+            avatar,
         };
         let welcome = ServerMsg::Welcome {
             you: id,
             server: self.info(),
             channels: self.channel_list(),
             users: self.users.values().map(|p| p.user.clone()).chain([user.clone()]).collect(),
-            roles: self.store.roles.clone(),
+            roles: self.roles.clone(),
         };
         self.broadcast(|_| true, &ServerMsg::UserJoined(user.clone()));
         let _ = a.tx.send(welcome);
-        info!(id, key = key_hex(&a.key), name = user.name, "joined");
+        if unread > 0 {
+            let text = match unread {
+                1 => "You have a new offline message".to_string(),
+                n => format!("You have {n} new offline messages"),
+            };
+            let _ = a.tx.send(ServerMsg::Notice { text });
+        }
+        self.log(format!("{} joined ({}, {})", user.name, key_hex(&a.key), a.ip));
         self.users.insert(id, Peer { user, conn: a.conn, tx: a.tx, ip: a.ip, whisper: None });
         Ok(id)
     }
@@ -247,9 +281,16 @@ impl State {
 
     /// Someone's connection ended; does nothing if they were already removed.
     pub fn depart(&mut self, id: UserId, reason: Leave) {
-        if self.users.remove(&id).is_some() {
+        if let Some(p) = self.users.remove(&id) {
+            let why = match &reason {
+                Leave::Quit => String::new(),
+                Leave::Lost => " (connection lost)".into(),
+                Leave::Kicked { by, reason } => format!(" (kicked by {}: {reason})", self.name(*by)),
+                Leave::Banned { by, reason } => format!(" (banned by {}: {reason})", self.name(*by)),
+                Leave::Replaced => " (connected again)".into(),
+            };
+            self.log(format!("{} left{why}", p.user.name));
             self.broadcast(|_| true, &ServerMsg::UserLeft { id, reason });
-            info!(id, "left");
             self.drop_empty_channels();
         }
     }
@@ -345,8 +386,8 @@ impl State {
                 }
                 let reason = limit(&reason, MAX_SHORT, "reasons")?;
                 let target = self.users.get(&user).ok_or("nobody with that id is here")?;
-                let (key, ip, name) = (key_hex(&target.user.key), target.ip.clone(), target.user.name.clone());
-                self.add_ban(id, Some(key), Some(ip), name, reason.clone(), secs);
+                let (key, ip, name) = (target.user.key, target.ip.clone(), target.user.name.clone());
+                self.add_ban(id, Some(key), Some(ip), name, reason.clone(), secs)?;
                 self.remove(user, Leave::Banned { by: id, reason });
                 Ok(())
             }
@@ -356,32 +397,36 @@ impl State {
                     return Err("a ban needs a key or an address".into());
                 }
                 if let Some(k) = key
-                    && let Some(acc) = self.store.account(&k)
+                    && let Some(acc) = stored(self.db.account(&k))?
                     && self.role(acc.role).rank >= self.role_of(id).rank
                 {
                     return Err("they rank the same as you or higher".into());
                 }
                 let reason = limit(&reason, MAX_SHORT, "reasons")?;
-                let name = key.and_then(|k| self.store.account(&k)).map(|a| a.name.clone()).unwrap_or_default();
-                self.add_ban(id, key.map(|k| key_hex(&k)), ip.map(|i| i.trim().to_string()), name, reason, secs);
+                let name = match key {
+                    Some(k) => stored(self.db.account_name(&k))?.unwrap_or_default(),
+                    None => String::new(),
+                };
+                let ip = ip.map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
+                self.add_ban(id, key, ip.clone(), name, reason, secs)?;
                 // anyone here it applies to goes
                 let gone: Vec<UserId> = self
                     .users
                     .values()
-                    .filter(|p| self.store.ban_for(&p.user.key, &p.ip).is_some() && p.user.id != id)
+                    .filter(|p| p.user.id != id && (Some(p.user.key) == key || Some(&p.ip) == ip.as_ref()))
                     .map(|p| p.user.id)
                     .collect();
                 for user in gone {
                     self.remove(user, Leave::Banned { by: id, reason: String::new() });
                 }
-                self.send(id, ServerMsg::Bans(self.store.bans()));
+                self.send(id, ServerMsg::Bans(stored(self.db.bans())?));
                 Ok(())
             }
             ClientMsg::Unban { id: ban } => {
                 self.may(id, Perm::Ban)?;
-                self.store.bans.retain(|b| b.id != ban);
-                self.save();
-                self.send(id, ServerMsg::Bans(self.store.bans()));
+                stored(self.db.delete_ban(ban))?;
+                self.log(format!("{} lifted ban {ban}", self.name(id)));
+                self.send(id, ServerMsg::Bans(stored(self.db.bans())?));
                 Ok(())
             }
             ClientMsg::ServerMute { user, muted } => {
@@ -403,50 +448,150 @@ impl State {
             ClientMsg::EditServer(edit) => self.edit_server(id, edit),
             ClientMsg::CreateToken { role, note } => {
                 self.may(id, Perm::ManageRoles)?;
-                let rank = self.store.role(role).ok_or("no such role")?.rank;
+                let rank = self.known_role(role)?.rank;
                 if rank > self.role_of(id).rank {
                     return Err("that role ranks higher than yours".into());
                 }
                 let token =
-                    Token { token: store::new_token(), role, note: limit(&note, MAX_SHORT, "notes")?, created: now() };
-                self.store.tokens.push(token.clone());
-                self.save();
+                    Token { token: db::new_token(), role, note: limit(&note, MAX_SHORT, "notes")?, created: now() };
+                stored(self.db.add_token(&token))?;
                 self.send(id, ServerMsg::TokenCreated(token));
                 Ok(())
             }
             ClientMsg::DeleteToken { token } => {
                 self.may(id, Perm::ManageRoles)?;
-                self.store.tokens.retain(|t| t.token != token);
-                self.save();
-                self.send(id, ServerMsg::Tokens(self.store.tokens.clone()));
+                stored(self.db.delete_token(&token))?;
+                self.send(id, ServerMsg::Tokens(stored(self.db.tokens())?));
                 Ok(())
             }
             ClientMsg::Redeem { token } => {
-                let pos =
-                    self.store.tokens.iter().position(|t| t.token == token.trim()).ok_or("that token doesn't work")?;
-                let token = self.store.tokens.remove(pos);
+                let role = stored(self.db.take_token(token.trim()))?.ok_or("that token doesn't work")?;
                 let key = self.user(id)?.key;
-                self.give_role(key, token.role);
-                let role = self.role(token.role).name.clone();
+                self.give_role(key, role)?;
+                let role = self.role(role).name.clone();
+                self.log(format!("{} redeemed a token for {role}", self.name(id)));
                 self.send(id, ServerMsg::Notice { text: format!("You're {role} now") });
                 Ok(())
             }
             ClientMsg::ListBans => {
                 self.may(id, Perm::Ban)?;
-                self.send(id, ServerMsg::Bans(self.store.bans()));
+                self.send(id, ServerMsg::Bans(stored(self.db.bans())?));
                 Ok(())
             }
             ClientMsg::ListAccounts => {
                 self.may(id, Perm::ManageRoles)?;
-                self.send(id, ServerMsg::Accounts(self.store.accounts()));
+                self.send(id, ServerMsg::Accounts(stored(self.db.accounts())?));
                 Ok(())
             }
             ClientMsg::ListTokens => {
                 self.may(id, Perm::ManageRoles)?;
-                self.send(id, ServerMsg::Tokens(self.store.tokens.clone()));
+                self.send(id, ServerMsg::Tokens(stored(self.db.tokens())?));
+                Ok(())
+            }
+            ClientMsg::ListFiles { channel, password, path } => {
+                let root = self.file_root(id, channel, password.as_deref(), None)?;
+                let entries = files::list(&root, &path)?;
+                self.send(id, ServerMsg::Files { channel, path, entries });
+                Ok(())
+            }
+            ClientMsg::MakeDir { channel, password, path } => {
+                let root = self.file_root(id, channel, password.as_deref(), Some(Perm::UploadFiles))?;
+                files::make_dir(&root, &path)?;
+                self.file_listing(id, channel, &root, files::parent(&path))
+            }
+            ClientMsg::DeleteFile { channel, password, path } => {
+                let root = self.file_root(id, channel, password.as_deref(), Some(Perm::ManageFiles))?;
+                files::delete(&root, &path)?;
+                self.log(format!("{} deleted {path} in channel {channel}", self.name(id)));
+                self.file_listing(id, channel, &root, files::parent(&path))
+            }
+            ClientMsg::RenameFile { channel, password, from, to } => {
+                let root = self.file_root(id, channel, password.as_deref(), Some(Perm::ManageFiles))?;
+                files::rename(&root, &from, &to)?;
+                self.file_listing(id, channel, &root, files::parent(&to))
+            }
+            ClientMsg::ClearAvatar => self.set_avatar(id, None),
+            ClientMsg::SendOffline { to, subject, text } => {
+                let subject = limit(&subject, MAX_SHORT, "subjects")?;
+                let text = limit(&text, MAX_CHAT, "messages")?;
+                if text.is_empty() && subject.is_empty() {
+                    return Err("the message is empty".into());
+                }
+                stored(self.db.account_name(&to))?.ok_or("nobody with that key has been here")?;
+                let me = self.user(id)?;
+                stored(self.db.send_offline(&to, &me.key, &me.name, &subject, &text))?;
+                // tell them now if they're here
+                for p in self.users.values().filter(|p| p.user.key == to) {
+                    let _ = p.tx.send(ServerMsg::Notice { text: format!("New offline message from {}", me.name) });
+                }
+                Ok(())
+            }
+            ClientMsg::ListInbox => self.send_inbox(id),
+            ClientMsg::MarkRead { id: message, read } => {
+                stored(self.db.mark_read(&self.user(id)?.key, message, read))?;
+                self.send_inbox(id)
+            }
+            ClientMsg::DeleteOffline { id: message } => {
+                stored(self.db.delete_offline(&self.user(id)?.key, message))?;
+                self.send_inbox(id)
+            }
+            ClientMsg::ReadLog { lines } => {
+                self.may(id, Perm::ManageServer)?;
+                self.send(id, ServerMsg::Log(stored(self.db.read_log(lines.min(10_000)))?));
                 Ok(())
             }
         }
+    }
+
+    fn send_inbox(&self, id: UserId) -> Outcome {
+        self.send(id, ServerMsg::Inbox(stored(self.db.inbox(&self.user(id)?.key))?));
+        Ok(())
+    }
+
+    /// The folder of a channel's files, if `id` may get in there (and has
+    /// `need`, for changes).
+    pub fn file_root(
+        &self,
+        id: UserId,
+        channel: ChannelId,
+        password: Option<&str>,
+        need: Option<Perm>,
+    ) -> Result<PathBuf, String> {
+        let c = &self.chan(channel).ok_or("no such channel")?.c;
+        if let Some(perm) = need {
+            self.may(id, perm)?;
+        }
+        let inside = self.user(id)?.channel == channel;
+        if let Some(hash) = &c.password
+            && !inside
+            && !self.role_of(id).can(Perm::JoinAny)
+            && !password.is_some_and(|p| check_password(hash, p))
+        {
+            return Err("that channel's files need its password".into());
+        }
+        Ok(files::channel_dir(&self.data_dir, channel))
+    }
+
+    fn file_listing(&self, id: UserId, channel: ChannelId, root: &std::path::Path, path: &str) -> Outcome {
+        let entries = files::list(root, path)?;
+        self.send(id, ServerMsg::Files { channel, path: path.to_string(), entries });
+        Ok(())
+    }
+
+    /// A new picture (its hash), or none.
+    pub fn set_avatar(&mut self, id: UserId, hash: Option<String>) -> Outcome {
+        let key = self.user(id)?.key;
+        stored(self.db.set_avatar(&key, hash.as_deref()))?;
+        if hash.is_none() {
+            let _ = std::fs::remove_file(files::avatar_path(&self.data_dir, &key));
+        }
+        self.update(id, |u| u.avatar = hash)
+    }
+
+    /// Who has this key's picture, for a download.
+    pub fn avatar_of(&self, key: &Key) -> Option<PathBuf> {
+        let path = files::avatar_path(&self.data_dir, key);
+        path.exists().then_some(path)
     }
 
     fn update(&mut self, id: UserId, f: impl FnOnce(&mut User)) -> Outcome {
@@ -524,8 +669,8 @@ impl State {
             self.chan(parent).ok_or("no such parent channel")?;
         }
         let name = self.channel_name(&new.name, new.parent, None)?;
-        let channel = self.store.next_channel;
-        self.store.next_channel += 1;
+        let channel = self.next_channel;
+        self.next_channel += 1;
         self.channels.push(Chan {
             c: StoredChannel {
                 id: channel,
@@ -540,7 +685,8 @@ impl State {
             },
             permanent: new.permanent,
         });
-        self.save();
+        self.save_channels();
+        self.log(format!("{} created the channel {}", self.name(id), new.name.trim()));
         self.channels_changed();
         // whoever makes a temporary channel goes in, or it'd vanish right away
         if !new.permanent {
@@ -602,7 +748,7 @@ impl State {
         if let Some(p) = e.permanent {
             chan.permanent = p;
         }
-        self.save();
+        self.save_channels();
         self.channels_changed();
         self.drop_empty_channels();
         Ok(())
@@ -635,7 +781,7 @@ impl State {
             None => self.channels.iter().position(|c| c.c.parent == parent),
         };
         self.channels.insert(at.unwrap_or(self.channels.len()), moving);
-        self.save();
+        self.save_channels();
         self.channels_changed();
         Ok(())
     }
@@ -660,6 +806,8 @@ impl State {
         if self.within(default, channel) {
             return Err("the default channel can't go (make another one the default first)".into());
         }
+        let name = self.chan(channel).map(|c| c.c.name.clone()).unwrap_or_default();
+        self.log(format!("{} deleted the channel {name}", self.name(id)));
         self.remove_channels(|s, c| s.within(c, channel));
         Ok(())
     }
@@ -674,7 +822,10 @@ impl State {
         let movers: Vec<UserId> =
             self.users.values().filter(|p| ids.contains(&p.user.channel)).map(|p| p.user.id).collect();
         self.channels.retain(|c| !ids.contains(&c.c.id));
-        self.save();
+        for id in &ids {
+            let _ = std::fs::remove_dir_all(files::channel_dir(&self.data_dir, *id));
+        }
+        self.save_channels();
         self.channels_changed();
         for id in movers {
             if let Some(p) = self.users.get_mut(&id) {
@@ -697,45 +848,47 @@ impl State {
     fn add_ban(
         &mut self,
         by: UserId,
-        key: Option<String>,
+        key: Option<Key>,
         ip: Option<String>,
         name: String,
         reason: String,
         secs: Option<u64>,
-    ) {
-        let id = self.store.next_ban;
-        self.store.next_ban += 1;
+    ) -> Outcome {
         let created = now();
         let by = self.name(by);
-        self.store.bans.push(StoredBan { id, key, ip, name, reason, by, created, until: secs.map(|s| created + s) });
-        self.save();
+        let what = if name.is_empty() { ip.clone().unwrap_or_default() } else { name.clone() };
+        let until = secs.map(|s| created + s);
+        stored(self.db.add_ban(&Ban { id: 0, key, ip, name, reason, by: by.clone(), created, until }))?;
+        self.log(format!("{by} banned {what}"));
+        Ok(())
     }
 
     fn set_role(&mut self, id: UserId, key: Key, role: RoleId) -> Outcome {
         self.may(id, Perm::ManageRoles)?;
         let mine = self.role_of(id).rank;
-        let new = self.store.role(role).ok_or("no such role")?;
+        let new = self.known_role(role)?;
         if new.rank > mine {
             return Err("that role ranks higher than yours".into());
         }
-        let acc = self.store.account(&key).ok_or("nobody with that key has been here")?;
+        let new = new.name.clone();
+        let acc = stored(self.db.account(&key))?.ok_or("nobody with that key has been here")?;
         let me = self.user(id)?.key;
         if key != me && self.role(acc.role).rank >= mine {
             return Err("they rank the same as you or higher".into());
         }
-        self.give_role(key, role);
+        self.give_role(key, role)?;
+        let who = stored(self.db.account_name(&key))?.unwrap_or_default();
+        self.log(format!("{} made {who} {new}", self.name(id)));
         Ok(())
     }
 
-    fn give_role(&mut self, key: Key, role: RoleId) {
-        if let Some(acc) = self.store.accounts.get_mut(&key_hex(&key)) {
-            acc.role = role;
-        }
-        self.save();
+    fn give_role(&mut self, key: Key, role: RoleId) -> Outcome {
+        stored(self.db.set_role(&key, role))?;
         let online: Vec<UserId> = self.users.values().filter(|p| p.user.key == key).map(|p| p.user.id).collect();
         for id in online {
-            let _ = self.update(id, |u| u.role = role);
+            self.update(id, |u| u.role = role)?;
         }
+        Ok(())
     }
 
     fn save_role(&mut self, id: UserId, mut role: Role) -> Outcome {
@@ -750,40 +903,35 @@ impl State {
         }
         role.perms.sort();
         role.perms.dedup();
-        if role.id == 0 {
-            role.id = self.store.next_role;
-            self.store.next_role += 1;
-            self.store.roles.push(role);
-        } else {
-            let existing = self.store.roles.iter_mut().find(|r| r.id == role.id).ok_or("no such role")?;
-            if existing.rank > mine {
-                return Err("that role ranks higher than yours".into());
-            }
-            *existing = role;
+        if role.id != 0 && self.known_role(role.id)?.rank > mine {
+            return Err("that role ranks higher than yours".into());
         }
-        self.save();
-        self.broadcast(|_| true, &ServerMsg::Roles(self.store.roles.clone()));
+        stored(self.db.save_role(&role))?;
+        self.roles = stored(self.db.roles())?;
+        self.log(format!("{} saved the role {}", self.name(id), role.name));
+        self.broadcast(|_| true, &ServerMsg::Roles(self.roles.clone()));
         Ok(())
     }
 
     fn delete_role(&mut self, id: UserId, role: RoleId) -> Outcome {
         self.may(id, Perm::ManageRoles)?;
-        let r = self.store.role(role).ok_or("no such role")?;
+        let r = self.known_role(role)?;
         if r.rank >= self.role_of(id).rank {
             return Err("that role ranks the same as yours or higher".into());
         }
-        if role == self.store.default_role {
+        if role == self.settings.default_role {
             return Err("new people get that role; it has to stay".into());
         }
-        self.store.roles.retain(|r| r.id != role);
-        self.store.tokens.retain(|t| t.role != role);
-        let fallback = self.store.default_role;
-        let keys: Vec<Key> = self.store.accounts().into_iter().filter(|a| a.role == role).map(|a| a.key).collect();
-        self.broadcast(|_| true, &ServerMsg::Roles(self.store.roles.clone()));
-        for key in keys {
-            self.give_role(key, fallback);
+        let name = r.name.clone();
+        let fallback = self.settings.default_role;
+        stored(self.db.delete_role(role, fallback))?;
+        self.roles = stored(self.db.roles())?;
+        self.log(format!("{} deleted the role {name}", self.name(id)));
+        self.broadcast(|_| true, &ServerMsg::Roles(self.roles.clone()));
+        let online: Vec<UserId> = self.users.values().filter(|p| p.user.role == role).map(|p| p.user.id).collect();
+        for user in online {
+            self.update(user, |u| u.role = fallback)?;
         }
-        self.save();
         Ok(())
     }
 
@@ -794,18 +942,19 @@ impl State {
             if n.is_empty() || n.chars().count() > MAX_CHANNEL_NAME {
                 return Err(format!("server names need 1 to {MAX_CHANNEL_NAME} characters"));
             }
-            self.store.name = n.to_string();
+            self.settings.name = n.to_string();
         }
         if let Some(w) = e.welcome {
-            self.store.welcome = limit(&w, MAX_DESCRIPTION, "welcome messages")?;
+            self.settings.welcome = limit(&w, MAX_DESCRIPTION, "welcome messages")?;
         }
         if let Some(m) = e.max_users {
-            self.store.max_users = m;
+            self.settings.max_users = m;
         }
         if let Some(p) = e.password {
-            self.store.password = p.filter(|p| !p.is_empty()).map(|p| hash_password(&p));
+            self.settings.password = p.filter(|p| !p.is_empty()).map(|p| hash_password(&p));
         }
-        self.save();
+        stored(self.db.save_settings(&self.settings))?;
+        self.log(format!("{} changed the server settings", self.name(id)));
         self.broadcast(|_| true, &ServerMsg::Server(self.info()));
         Ok(())
     }
@@ -837,6 +986,15 @@ impl State {
             self.users.values().filter(hears).filter(|p| p.user.channel == channel).map(|p| p.conn.clone()).collect();
         (to, false)
     }
+}
+
+/// A database result for a client: failures are logged, and the client
+/// only hears that it didn't work.
+pub fn stored<T>(r: anyhow::Result<T>) -> Result<T, String> {
+    r.map_err(|e| {
+        warn!("database: {e:#}");
+        "the server couldn't do that (storage problem)".to_string()
+    })
 }
 
 /// `text` trimmed, if it isn't longer than `max` characters.
