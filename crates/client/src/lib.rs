@@ -181,6 +181,28 @@ impl Client {
         self.voice().recv().await
     }
 
+    /// Files and avatars; the handle can go to other tasks.
+    pub fn files(&self) -> Files {
+        Files(self.conn.clone())
+    }
+
+    /// Receives voice on its own, so it can be awaited next to `next_event`.
+    pub fn voice(&self) -> VoiceReceiver {
+        VoiceReceiver(self.conn.clone())
+    }
+
+    /// Leave, and wait until the server has been told.
+    pub async fn close(self) {
+        self.conn.close(0u32.into(), b"bye");
+        self.endpoint.wait_idle().await;
+    }
+}
+
+/// File transfers on a connection (each on its own stream).
+#[derive(Clone)]
+pub struct Files(quinn::Connection);
+
+impl Files {
     /// Start a download (a channel file or an avatar): its size and the
     /// stream its bytes come on.
     pub async fn download(&self, request: Request) -> Result<(u64, RecvStream)> {
@@ -218,20 +240,9 @@ impl Client {
     }
 
     async fn open_transfer(&self, request: &Request) -> Result<(SendStream, RecvStream)> {
-        let (mut send, recv) = self.conn.open_bi().await?;
+        let (mut send, recv) = self.0.open_bi().await?;
         write_msg(&mut send, request).await?;
         Ok((send, recv))
-    }
-
-    /// Receives voice on its own, so it can be awaited next to `next_event`.
-    pub fn voice(&self) -> VoiceReceiver {
-        VoiceReceiver(self.conn.clone())
-    }
-
-    /// Leave, and wait until the server has been told.
-    pub async fn close(self) {
-        self.conn.close(0u32.into(), b"bye");
-        self.endpoint.wait_idle().await;
     }
 }
 

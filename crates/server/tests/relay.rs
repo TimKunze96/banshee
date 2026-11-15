@@ -325,12 +325,15 @@ async fn channel_files() {
     let lobby = a.channels[0].id;
     let up = |path: &str, size| Request::Upload { channel: lobby, password: None, path: path.into(), size };
 
-    let mut upload = a.upload(up("/docs/notes.txt", 5)).await.unwrap();
+    let mut upload = a.files().upload(up("/docs/notes.txt", 5)).await.unwrap();
     upload.send.write_all(b"hello").await.unwrap();
     upload.finish().await.unwrap();
 
-    let (size, recv) =
-        a.download(Request::Download { channel: lobby, password: None, path: "/docs/notes.txt".into() }).await.unwrap();
+    let (size, recv) = a
+        .files()
+        .download(Request::Download { channel: lobby, password: None, path: "/docs/notes.txt".into() })
+        .await
+        .unwrap();
     let mut data = Vec::new();
     recv.take(size).read_to_end(&mut data).await.unwrap();
     assert_eq!(data, b"hello");
@@ -342,11 +345,11 @@ async fn channel_files() {
     assert_eq!((entries[0].name.as_str(), entries[0].size), ("notes.txt", 5));
 
     // a short upload doesn't count, a big one isn't taken, and paths stay in the channel
-    let mut short = a.upload(up("/short.txt", 10)).await.unwrap();
+    let mut short = a.files().upload(up("/short.txt", 10)).await.unwrap();
     short.send.write_all(b"abc").await.unwrap();
     assert!(short.finish().await.is_err());
-    assert!(a.upload(up("/big.bin", 2_000_000)).await.is_err());
-    assert!(a.upload(up("/../escape.txt", 1)).await.is_err());
+    assert!(a.files().upload(up("/big.bin", 2_000_000)).await.is_err());
+    assert!(a.files().upload(up("/../escape.txt", 1)).await.is_err());
 
     // members can't delete
     a.send(ClientMsg::DeleteFile { channel: lobby, password: None, path: "/docs/notes.txt".into() });
@@ -359,7 +362,7 @@ async fn channel_files() {
     admin.send(ClientMsg::EditChannel { id: games, edit });
     wait_for(&mut a, |e| matches!(e, ServerMsg::Channels(c) if c[1].has_password)).await;
     let locked = Request::Download { channel: games, password: None, path: "/x".into() };
-    let err = a.download(locked).await.err().unwrap();
+    let err = a.files().download(locked).await.err().unwrap();
     assert!(err.to_string().contains("password"), "{err}");
 
     admin.send(ClientMsg::DeleteFile { channel: lobby, password: None, path: "/docs".into() });
@@ -372,17 +375,17 @@ async fn avatars() {
     let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
     let mut b = connect(&s, "B", &Identity::generate()).await.unwrap();
     let png = b"\x89PNG\r\n\x1a\nnot really a picture";
-    a.set_avatar(png).await.unwrap();
+    a.files().set_avatar(png).await.unwrap();
     let ServerMsg::UserChanged(u) =
         wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.avatar.is_some())).await
     else {
         unreachable!()
     };
-    assert_eq!(b.avatar(u.key).await.unwrap(), png);
-    assert!(a.set_avatar(b"GIF89a").await.is_err());
+    assert_eq!(b.files().avatar(u.key).await.unwrap(), png);
+    assert!(a.files().set_avatar(b"GIF89a").await.is_err());
     a.send(ClientMsg::ClearAvatar);
     wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.avatar.is_none())).await;
-    assert!(b.avatar(u.key).await.is_err());
+    assert!(b.files().avatar(u.key).await.is_err());
     sync(&mut a).await;
 }
 
