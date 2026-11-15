@@ -6,18 +6,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+pub use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
 use banshee_proto::{ALPN, IDENTITY_LABEL, PROTOCOL_VERSION, read_msg, voice, write_msg};
 pub use banshee_proto::{
-    Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, Key, Leave, NewChannel, Perm, Role, RoleId,
-    ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex, parse_key,
+    Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, FileEntry, Key, Leave, LogLine, NewChannel,
+    OfflineMessage, Perm, Role, RoleId, ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex,
+    parse_key,
 };
 use quinn::crypto::rustls::QuicClientConfig;
+pub use quinn::{RecvStream, SendStream};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 /// Who we are to servers: an Ed25519 key pair. Keep it, or servers forget
@@ -177,6 +181,48 @@ impl Client {
         self.voice().recv().await
     }
 
+    /// Start a download (a channel file or an avatar): its size and the
+    /// stream its bytes come on.
+    pub async fn download(&self, request: Request) -> Result<(u64, RecvStream)> {
+        let (_send, mut recv) = self.open_transfer(&request).await?;
+        match read_msg::<_, Reply>(&mut recv).await? {
+            Reply::Ready { size } => Ok((size, recv)),
+            Reply::Refused { message } => bail!(message),
+            Reply::Done => bail!("unexpected answer"),
+        }
+    }
+
+    /// Start an upload: write the bytes to the returned upload, then `finish` it.
+    pub async fn upload(&self, request: Request) -> Result<Upload> {
+        let (send, mut recv) = self.open_transfer(&request).await?;
+        match read_msg::<_, Reply>(&mut recv).await? {
+            Reply::Ready { .. } => Ok(Upload { send, recv }),
+            Reply::Refused { message } => bail!(message),
+            Reply::Done => bail!("unexpected answer"),
+        }
+    }
+
+    /// Someone's picture.
+    pub async fn avatar(&self, key: Key) -> Result<Vec<u8>> {
+        let (size, recv) = self.download(Request::Avatar { key }).await?;
+        let mut data = Vec::new();
+        recv.take(size.min(MAX_AVATAR)).read_to_end(&mut data).await?;
+        Ok(data)
+    }
+
+    /// Our picture (PNG or JPEG); `ClientMsg::ClearAvatar` removes it.
+    pub async fn set_avatar(&self, picture: &[u8]) -> Result<()> {
+        let mut up = self.upload(Request::SetAvatar { size: picture.len() as u64 }).await?;
+        up.send.write_all(picture).await?;
+        up.finish().await
+    }
+
+    async fn open_transfer(&self, request: &Request) -> Result<(SendStream, RecvStream)> {
+        let (mut send, recv) = self.conn.open_bi().await?;
+        write_msg(&mut send, request).await?;
+        Ok((send, recv))
+    }
+
     /// Receives voice on its own, so it can be awaited next to `next_event`.
     pub fn voice(&self) -> VoiceReceiver {
         VoiceReceiver(self.conn.clone())
@@ -186,6 +232,23 @@ impl Client {
     pub async fn close(self) {
         self.conn.close(0u32.into(), b"bye");
         self.endpoint.wait_idle().await;
+    }
+}
+
+pub struct Upload {
+    pub send: SendStream,
+    recv: RecvStream,
+}
+
+impl Upload {
+    /// Say we're through and wait until the server kept the file.
+    pub async fn finish(mut self) -> Result<()> {
+        self.send.finish()?;
+        match read_msg::<_, Reply>(&mut self.recv).await? {
+            Reply::Done => Ok(()),
+            Reply::Refused { message } => bail!(message),
+            Reply::Ready { .. } => bail!("unexpected answer"),
+        }
     }
 }
 

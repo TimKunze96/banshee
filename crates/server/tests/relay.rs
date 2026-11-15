@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use banshee_client::{
-    ChannelEdit, ChatTarget, Client, ClientMsg, Identity, Leave, NewChannel, Options, ServerMsg, Whisper,
+    ChannelEdit, ChatTarget, Client, ClientMsg, Identity, Leave, NewChannel, Options, Request, ServerMsg, Whisper,
 };
 use banshee_server::{Config, Server};
+use tokio::io::AsyncReadExt;
 
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(300);
@@ -31,6 +32,7 @@ async fn start(name: &str, keep: bool) -> Running {
         bind: "127.0.0.1:0".parse().unwrap(),
         data_dir: dir,
         channels: vec!["Lobby".into(), "Games".into()],
+        max_file: 1_000_000,
     })
     .unwrap();
     let (addr, fp, token) = (server.local_addr().unwrap(), server.fingerprint().to_string(), server.admin_token());
@@ -314,4 +316,102 @@ async fn who_gets_heard() {
     wait_for(&mut a, |e| matches!(e, ServerMsg::UserChanged(u) if u.server_muted)).await;
     a.send_voice(4, b"z").unwrap();
     assert!(tokio::time::timeout(QUIET, admin.recv_voice()).await.is_err());
+}
+
+#[tokio::test]
+async fn channel_files() {
+    let s = start("files", false).await;
+    let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
+    let lobby = a.channels[0].id;
+    let up = |path: &str, size| Request::Upload { channel: lobby, password: None, path: path.into(), size };
+
+    let mut upload = a.upload(up("/docs/notes.txt", 5)).await.unwrap();
+    upload.send.write_all(b"hello").await.unwrap();
+    upload.finish().await.unwrap();
+
+    let (size, recv) =
+        a.download(Request::Download { channel: lobby, password: None, path: "/docs/notes.txt".into() }).await.unwrap();
+    let mut data = Vec::new();
+    recv.take(size).read_to_end(&mut data).await.unwrap();
+    assert_eq!(data, b"hello");
+
+    a.send(ClientMsg::ListFiles { channel: lobby, password: None, path: "/docs".into() });
+    let ServerMsg::Files { entries, .. } = wait_for(&mut a, |e| matches!(e, ServerMsg::Files { .. })).await else {
+        unreachable!()
+    };
+    assert_eq!((entries[0].name.as_str(), entries[0].size), ("notes.txt", 5));
+
+    // a short upload doesn't count, a big one isn't taken, and paths stay in the channel
+    let mut short = a.upload(up("/short.txt", 10)).await.unwrap();
+    short.send.write_all(b"abc").await.unwrap();
+    assert!(short.finish().await.is_err());
+    assert!(a.upload(up("/big.bin", 2_000_000)).await.is_err());
+    assert!(a.upload(up("/../escape.txt", 1)).await.is_err());
+
+    // members can't delete
+    a.send(ClientMsg::DeleteFile { channel: lobby, password: None, path: "/docs/notes.txt".into() });
+    wait_for(&mut a, |e| matches!(e, ServerMsg::Error { .. })).await;
+
+    // a password keeps other people's hands off a channel's files
+    let mut admin = admin(&s, "Admin").await;
+    let games = admin.channels[1].id;
+    let edit = ChannelEdit { password: Some(Some("pw".into())), ..Default::default() };
+    admin.send(ClientMsg::EditChannel { id: games, edit });
+    wait_for(&mut a, |e| matches!(e, ServerMsg::Channels(c) if c[1].has_password)).await;
+    let locked = Request::Download { channel: games, password: None, path: "/x".into() };
+    let err = a.download(locked).await.err().unwrap();
+    assert!(err.to_string().contains("password"), "{err}");
+
+    admin.send(ClientMsg::DeleteFile { channel: lobby, password: None, path: "/docs".into() });
+    wait_for(&mut admin, |e| matches!(e, ServerMsg::Files { entries, .. } if entries.is_empty())).await;
+}
+
+#[tokio::test]
+async fn avatars() {
+    let s = start("avatars", false).await;
+    let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
+    let mut b = connect(&s, "B", &Identity::generate()).await.unwrap();
+    let png = b"\x89PNG\r\n\x1a\nnot really a picture";
+    a.set_avatar(png).await.unwrap();
+    let ServerMsg::UserChanged(u) =
+        wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.avatar.is_some())).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(b.avatar(u.key).await.unwrap(), png);
+    assert!(a.set_avatar(b"GIF89a").await.is_err());
+    a.send(ClientMsg::ClearAvatar);
+    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.avatar.is_none())).await;
+    assert!(b.avatar(u.key).await.is_err());
+    sync(&mut a).await;
+}
+
+#[tokio::test]
+async fn offline_messages_and_the_log() {
+    let s = start("offline", false).await;
+    let b_id = Identity::generate();
+    let b = connect(&s, "B", &b_id).await.unwrap();
+    b.close().await;
+    let mut admin = admin(&s, "Admin").await;
+    admin.send(ClientMsg::SendOffline { to: b_id.key(), subject: "hey".into(), text: "call me".into() });
+    sync(&mut admin).await;
+
+    let mut b = connect(&s, "B", &b_id).await.unwrap();
+    let notice = wait_for(&mut b, |e| matches!(e, ServerMsg::Notice { .. })).await;
+    assert_eq!(notice, ServerMsg::Notice { text: "You have a new offline message".into() });
+    b.send(ClientMsg::ListInbox);
+    let ServerMsg::Inbox(inbox) = wait_for(&mut b, |e| matches!(e, ServerMsg::Inbox(_))).await else { unreachable!() };
+    assert_eq!((inbox[0].from_name.as_str(), inbox[0].text.as_str(), inbox[0].read), ("Admin", "call me", false));
+    b.send(ClientMsg::MarkRead { id: inbox[0].id, read: true });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Inbox(i) if i[0].read)).await;
+    b.send(ClientMsg::DeleteOffline { id: inbox[0].id });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Inbox(i) if i.is_empty())).await;
+
+    b.send(ClientMsg::ReadLog { lines: 10 });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Error { .. })).await;
+    admin.send(ClientMsg::ReadLog { lines: 50 });
+    let ServerMsg::Log(log) = wait_for(&mut admin, |e| matches!(e, ServerMsg::Log(_))).await else { unreachable!() };
+    let text: Vec<&str> = log.iter().map(|l| l.text.as_str()).collect();
+    assert!(text.iter().any(|t| t.starts_with("B joined")), "{text:?}");
+    assert!(text.contains(&"Admin redeemed a token for Admin"), "{text:?}");
 }

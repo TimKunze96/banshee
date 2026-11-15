@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .collect(),
+        max_file: env("BANSHEE_MAX_FILE_MB", "500").parse::<u64>().context("BANSHEE_MAX_FILE_MB")? * 1_000_000,
     };
     let server = Server::bind(config)?;
     info!(addr = %server.local_addr()?, fingerprint = server.fingerprint(), "listening");

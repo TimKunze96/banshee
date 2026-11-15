@@ -7,7 +7,8 @@ so a group can talk without a TeamSpeak license.
 What works: a channel tree with passwords, user limits, talk power and
 temporary channels; channel, server and private chat; pokes; whispering;
 roles with permissions (Admin, Moderator, Member and Guest to start with, all
-editable); kicks, bans and server mutes; one-time tokens that hand out roles.
+editable); kicks, bans and server mutes; one-time tokens that hand out roles;
+channel files; avatars; offline messages and a server log.
 Everything runs over QUIC (encrypted, one UDP port). Voice is Opus; the
 server only forwards it and never decodes anything.
 
@@ -31,10 +32,13 @@ It listens on UDP port 7700. Settings are environment variables:
 
 - `BANSHEE_CHANNELS`: channels for a new server, comma separated (default `Lobby,Gaming,AFK`)
 - `BANSHEE_BIND`: address and port (default `0.0.0.0:7700`)
-- `BANSHEE_DATA`: where the certificate and `state.json` live (default `/data` in Docker)
+- `BANSHEE_DATA`: where the certificate, database and files live (default `/data` in Docker)
+- `BANSHEE_MAX_FILE_MB`: biggest file upload (default 500)
 
-Channels, roles, accounts, bans and tokens are kept in `state.json`. After
-the first start, channels are managed from a client.
+Channels, roles, accounts, bans, tokens, offline messages and the log are
+kept in `banshee.db` (SQLite), channel files under `files/` and avatars under
+`avatars/`. A `state.json` from an older version is taken over on start.
+After the first start, channels are managed from a client.
 
 The server makes its own certificate on first start and keeps it in the data
 volume. Clients pin its fingerprint, so there's no domain or CA needed.
@@ -60,7 +64,7 @@ uses a token, `/quit` leaves. Its identity is kept in `banshee-identity.der`.
 
 ## Next
 
-File sharing, avatars, then screen sharing and streaming.
+Screen sharing and streaming.
 
 ## License
 

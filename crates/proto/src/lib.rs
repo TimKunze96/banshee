@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on incompatible changes; the server refuses other versions.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The ALPN both sides agree on.
 pub const ALPN: &[u8] = b"banshee/1";
@@ -94,6 +94,8 @@ pub struct User {
     pub talk_granted: bool,
     /// Asking for talk power, with a message.
     pub talk_request: Option<String>,
+    /// Hash of their picture (fetch it with [`transfer::Request::Avatar`]).
+    pub avatar: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -113,10 +115,14 @@ pub enum Perm {
     Ban,
     /// Mute people server-wide and grant talk power.
     Mute,
+    /// Upload files and make folders in channels they can get into.
+    UploadFiles,
+    /// Delete and rename files.
+    ManageFiles,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 9] = [
+    pub const ALL: [Perm; 11] = [
         Perm::ManageServer,
         Perm::ManageRoles,
         Perm::ManageChannels,
@@ -126,6 +132,8 @@ impl Perm {
         Perm::Kick,
         Perm::Ban,
         Perm::Mute,
+        Perm::UploadFiles,
+        Perm::ManageFiles,
     ];
 }
 
@@ -168,6 +176,35 @@ pub struct Ban {
     pub created: u64,
     /// Unix seconds; None: for good.
     pub until: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+    /// Unix seconds.
+    pub modified: u64,
+    pub is_dir: bool,
+}
+
+/// A message left for someone who wasn't there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineMessage {
+    pub id: u32,
+    pub from: Key,
+    pub from_name: String,
+    pub subject: String,
+    pub text: String,
+    /// Unix seconds.
+    pub sent: u64,
+    pub read: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// Unix seconds.
+    pub time: u64,
+    pub text: String,
 }
 
 /// A one-time code that gives whoever redeems it a role.
@@ -343,6 +380,49 @@ pub enum ClientMsg {
     ListBans,
     ListAccounts,
     ListTokens,
+
+    /// Files in a channel folder ("" or "/" for the top); answered with `Files`.
+    ListFiles {
+        channel: ChannelId,
+        password: Option<String>,
+        path: String,
+    },
+    MakeDir {
+        channel: ChannelId,
+        password: Option<String>,
+        path: String,
+    },
+    DeleteFile {
+        channel: ChannelId,
+        password: Option<String>,
+        path: String,
+    },
+    RenameFile {
+        channel: ChannelId,
+        password: Option<String>,
+        from: String,
+        to: String,
+    },
+    ClearAvatar,
+
+    /// Leave a message for someone (online or not), by key.
+    SendOffline {
+        to: Key,
+        subject: String,
+        text: String,
+    },
+    ListInbox,
+    MarkRead {
+        id: u32,
+        read: bool,
+    },
+    DeleteOffline {
+        id: u32,
+    },
+    /// The last lines of the server log.
+    ReadLog {
+        lines: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +486,13 @@ pub enum ServerMsg {
     Notice {
         text: String,
     },
+    Files {
+        channel: ChannelId,
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    Inbox(Vec<OfflineMessage>),
+    Log(Vec<LogLine>),
     /// A request was refused. The connection stays up unless it was `Hello`.
     Error {
         message: String,
@@ -456,6 +543,49 @@ where
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body).await?;
     Ok(postcard::from_bytes(&body)?)
+}
+
+/// File transfers. Each one gets its own bidirectional stream: the client
+/// sends a [`transfer::Request`] (framed like control messages), the server
+/// answers with a [`transfer::Reply`]. A download's bytes follow `Ready`; an
+/// upload's bytes follow the client's request once `Ready` came, the client
+/// finishes the stream, and the server answers `Done` once the file is kept.
+pub mod transfer {
+    use super::{ChannelId, Key};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Request {
+        Download {
+            channel: ChannelId,
+            password: Option<String>,
+            path: String,
+        },
+        Upload {
+            channel: ChannelId,
+            password: Option<String>,
+            path: String,
+            size: u64,
+        },
+        /// Someone's picture.
+        Avatar {
+            key: Key,
+        },
+        /// Our picture (PNG or JPEG).
+        SetAvatar {
+            size: u64,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Reply {
+        Ready { size: u64 },
+        Done,
+        Refused { message: String },
+    }
+
+    /// Biggest avatar the server takes.
+    pub const MAX_AVATAR: u64 = 512 * 1024;
 }
 
 /// Voice datagrams. Up: `seq (u16 LE) | opus`. Down: the server puts the
