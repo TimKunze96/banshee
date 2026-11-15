@@ -1,12 +1,13 @@
 //! Talk to a Banshee server from the terminal: lines are chat, `/join <id>`
-//! changes channel, `/quit` leaves.
+//! changes channel, `/redeem <token>` uses a token, `/quit` leaves. The
+//! identity lives in `banshee-identity.der` in the current directory.
 //!
 //! banshee-cli <host:port> <name> [fingerprint]
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use banshee_client::{Client, ServerMsg};
+use banshee_client::{Client, ClientMsg, Identity, Options, ServerMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]
@@ -17,7 +18,9 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     };
     let addr = tokio::net::lookup_host(addr).await?.next().context("no address for that host")?;
-    let mut client = Client::connect(addr, name, rest.first().map(String::as_str)).await?;
+    let identity = Identity::load_or_create("banshee-identity.der".as_ref())?;
+    let opts = Options { name, identity: &identity, fingerprint: rest.first().map(String::as_str), password: None };
+    let mut client = Client::connect(addr, opts).await?;
     println!("connected, server fingerprint {}", client.fingerprint);
     for c in &client.channels {
         println!("  channel {}: {}", c.id, c.name);
@@ -33,6 +36,7 @@ async fn main() -> Result<()> {
                         Ok(id) => client.join(id),
                         Err(_) => println!("/join takes a channel id"),
                     },
+                    Some(("/redeem", token)) => client.send(ClientMsg::Redeem { token: token.trim().into() }),
                     _ if line.trim() == "/quit" => break,
                     _ if line.trim().is_empty() => {}
                     _ => client.chat(&line),
@@ -46,14 +50,18 @@ async fn main() -> Result<()> {
                         println!("{} joined", u.name);
                         names.insert(u.id, u.name);
                     }
-                    ServerMsg::UserLeft { id } => {
-                        println!("{} left", name(id));
+                    ServerMsg::UserLeft { id, reason } => {
+                        println!("{} left ({reason:?})", name(id));
                         names.remove(&id);
                     }
-                    ServerMsg::UserMoved { id, channel } => println!("{} moved to channel {channel}", name(id)),
+                    ServerMsg::UserChanged(u) => {
+                        names.insert(u.id, u.name);
+                    }
                     ServerMsg::Chat { from, text, .. } => println!("<{}> {text}", name(from)),
+                    ServerMsg::Poke { from, text } => println!("{} pokes you: {text}", name(from)),
+                    ServerMsg::Notice { text } => println!("{text}"),
                     ServerMsg::Error { message } => println!("error: {message}"),
-                    ServerMsg::Welcome { .. } => {}
+                    other => println!("{other:?}"),
                 }
             }
         }

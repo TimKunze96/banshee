@@ -6,9 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use banshee_proto::{ALPN, ClientMsg, PROTOCOL_VERSION, read_msg, voice, write_msg};
-pub use banshee_proto::{Channel, ChannelId, ServerMsg, User, UserId};
+use banshee_proto::{ALPN, IDENTITY_LABEL, PROTOCOL_VERSION, read_msg, voice, write_msg};
+pub use banshee_proto::{
+    Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, Key, Leave, NewChannel, Perm, Role, RoleId,
+    ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex, parse_key,
+};
 use quinn::crypto::rustls::QuicClientConfig;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -16,9 +20,56 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+/// Who we are to servers: an Ed25519 key pair. Keep it, or servers forget
+/// our role and bans no longer stick.
+pub struct Identity(Ed25519KeyPair, Vec<u8>);
+
+impl Identity {
+    pub fn generate() -> Self {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("random key");
+        Self::from_pkcs8(pkcs8.as_ref()).expect("a key we just made")
+    }
+
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self> {
+        let pair = Ed25519KeyPair::from_pkcs8(der).map_err(|e| anyhow::anyhow!("bad identity key: {e}"))?;
+        Ok(Self(pair, der.to_vec()))
+    }
+
+    /// The key in `path`, or a new one saved there.
+    pub fn load_or_create(path: &std::path::Path) -> Result<Self> {
+        if let Ok(der) = std::fs::read(path) {
+            return Self::from_pkcs8(&der);
+        }
+        let id = Self::generate();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, id.pkcs8()).with_context(|| format!("saving {}", path.display()))?;
+        Ok(id)
+    }
+
+    pub fn pkcs8(&self) -> &[u8] {
+        &self.1
+    }
+
+    pub fn key(&self) -> Key {
+        self.0.public_key().as_ref().try_into().expect("ed25519 keys are 32 bytes")
+    }
+}
+
+pub struct Options<'a> {
+    pub name: &'a str,
+    pub identity: &'a Identity,
+    /// The server's certificate fingerprint; None takes any (first use).
+    pub fingerprint: Option<&'a str>,
+    pub password: Option<&'a str>,
+}
+
 pub struct Client {
     pub you: UserId,
+    pub server: ServerInfo,
     pub channels: Vec<Channel>,
+    pub roles: Vec<Role>,
     /// Everyone on the server when we joined, us included.
     pub users: Vec<User>,
     /// The server's certificate fingerprint, to pin next time.
@@ -33,14 +84,14 @@ pub struct Client {
 pub struct Voice {
     pub from: UserId,
     pub seq: u16,
+    pub whisper: bool,
     pub opus: Vec<u8>,
 }
 
 impl Client {
-    /// Connect and say hello. With a `fingerprint`, the server's certificate
-    /// has to match it; without one, any certificate is taken (first use).
-    pub async fn connect(addr: SocketAddr, name: &str, fingerprint: Option<&str>) -> Result<Self> {
-        let verifier = Arc::new(Pinned::new(fingerprint.map(str::to_lowercase)));
+    /// Connect and say hello.
+    pub async fn connect(addr: SocketAddr, opts: Options<'_>) -> Result<Self> {
+        let verifier = Arc::new(Pinned::new(opts.fingerprint.map(str::to_lowercase)));
         let provider = verifier.provider.clone();
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -59,13 +110,23 @@ impl Client {
         let conn = endpoint.connect(addr, "banshee")?.await.with_context(|| format!("connecting to {addr}"))?;
         let fingerprint = verifier.seen().unwrap_or_default();
 
+        let mut binding = [0u8; 32];
+        conn.export_keying_material(&mut binding, IDENTITY_LABEL, b"")
+            .map_err(|_| anyhow::anyhow!("no keying material"))?;
+        let hello = ClientMsg::Hello {
+            protocol: PROTOCOL_VERSION,
+            name: opts.name.to_string(),
+            key: opts.identity.key(),
+            signature: opts.identity.0.sign(&binding).as_ref().to_vec(),
+            password: opts.password.map(str::to_string),
+        };
         let (mut send, mut recv) = conn.open_bi().await?;
-        write_msg(&mut send, &ClientMsg::Hello { protocol: PROTOCOL_VERSION, name: name.to_string() }).await?;
+        write_msg(&mut send, &hello).await?;
         let welcome = tokio::time::timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(&mut recv))
             .await
             .context("the server didn't answer")??;
-        let (you, channels, users) = match welcome {
-            ServerMsg::Welcome { you, channels, users } => (you, channels, users),
+        let (you, server, channels, users, roles) = match welcome {
+            ServerMsg::Welcome { you, server, channels, users, roles } => (you, server, channels, users, roles),
             ServerMsg::Error { message } => bail!("refused: {message}"),
             other => bail!("unexpected answer: {other:?}"),
         };
@@ -86,15 +147,20 @@ impl Client {
                 }
             }
         });
-        Ok(Self { you, channels, users, fingerprint, conn, control, events, endpoint })
+        Ok(Self { you, server, channels, users, roles, fingerprint, conn, control, events, endpoint })
+    }
+
+    pub fn send(&self, msg: ClientMsg) {
+        let _ = self.control.send(msg);
     }
 
     pub fn join(&self, channel: ChannelId) {
-        let _ = self.control.send(ClientMsg::Join { channel });
+        self.send(ClientMsg::Join { channel, password: None });
     }
 
+    /// Text to our channel.
     pub fn chat(&self, text: &str) {
-        let _ = self.control.send(ClientMsg::Chat { text: text.to_string() });
+        self.send(ClientMsg::Chat { to: ChatTarget::Channel, text: text.to_string() });
     }
 
     /// The next message from the server; None once the connection is gone.
@@ -131,7 +197,7 @@ impl VoiceReceiver {
         loop {
             let data = self.0.read_datagram().await?;
             if let Some(d) = voice::decode_down(&data) {
-                return Ok(Voice { from: d.from, seq: d.seq, opus: d.opus.to_vec() });
+                return Ok(Voice { from: d.from, seq: d.seq, whisper: d.whisper, opus: d.opus.to_vec() });
             }
         }
     }

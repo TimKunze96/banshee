@@ -24,6 +24,9 @@ async fn main() -> Result<()> {
     };
     let server = Server::bind(config)?;
     info!(addr = %server.local_addr()?, fingerprint = server.fingerprint(), "listening");
+    if let Some(token) = server.admin_token() {
+        info!("redeem this token to become admin: {token}");
+    }
     tokio::select! {
         () = server.run() => {}
         () = shutdown() => info!("shutting down"),

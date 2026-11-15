@@ -4,33 +4,231 @@
 //! control messages ([`ClientMsg`] up, [`ServerMsg`] down), each framed as a
 //! little-endian `u32` length followed by the postcard encoding. Voice goes
 //! as unreliable QUIC datagrams (see [`voice`]).
+//!
+//! People are known by an Ed25519 key. `Hello` carries the public key and a
+//! signature over TLS keying material of this connection (see
+//! [`IDENTITY_LABEL`]), so it can't be replayed on another one.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on incompatible changes; the server refuses other versions.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The ALPN both sides agree on.
 pub const ALPN: &[u8] = b"banshee/1";
+
+/// Label for the TLS exporter whose output `Hello` signs (32 bytes, empty context).
+pub const IDENTITY_LABEL: &[u8] = b"banshee identity";
 
 /// Control messages are small; anything bigger is a broken or hostile peer.
 pub const MAX_FRAME: u32 = 64 * 1024;
 
 pub type UserId = u32;
 pub type ChannelId = u32;
+pub type RoleId = u32;
+/// An Ed25519 public key.
+pub type Key = [u8; 32];
+
+/// A key as lowercase hex, the way people and files see it.
+pub fn key_hex(key: &Key) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn parse_key(hex: &str) -> Option<Key> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(key)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    /// Shown to everyone who connects.
+    pub welcome: String,
+    pub max_users: Option<u32>,
+    pub has_password: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
+    /// None: top level.
+    pub parent: Option<ChannelId>,
     pub name: String,
+    pub topic: String,
+    pub description: String,
+    pub has_password: bool,
+    pub max_users: Option<u32>,
+    /// Talk power needed to be heard here (0: everyone).
+    pub talk_power: u32,
+    /// Temporary channels go away once the last person leaves.
+    pub permanent: bool,
+    /// Where people land when they connect.
+    pub default: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     pub id: UserId,
+    pub key: Key,
     pub name: String,
     pub channel: ChannelId,
+    pub role: RoleId,
+    pub input_muted: bool,
+    pub output_muted: bool,
+    /// Some(message): away (the message may be empty).
+    pub away: Option<String>,
+    pub description: String,
+    /// Silenced by a moderator.
+    pub server_muted: bool,
+    /// May talk in any channel, whatever its talk power.
+    pub talk_granted: bool,
+    /// Asking for talk power, with a message.
+    pub talk_request: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Perm {
+    /// Server name, welcome message, password, user limit.
+    ManageServer,
+    /// Create and edit roles, give people roles, make tokens.
+    ManageRoles,
+    /// Create, edit, move and delete any channel.
+    ManageChannels,
+    /// Create temporary channels.
+    CreateTempChannels,
+    /// Join channels that are full or have a password.
+    JoinAny,
+    MoveUsers,
+    Kick,
+    Ban,
+    /// Mute people server-wide and grant talk power.
+    Mute,
+}
+
+impl Perm {
+    pub const ALL: [Perm; 9] = [
+        Perm::ManageServer,
+        Perm::ManageRoles,
+        Perm::ManageChannels,
+        Perm::CreateTempChannels,
+        Perm::JoinAny,
+        Perm::MoveUsers,
+        Perm::Kick,
+        Perm::Ban,
+        Perm::Mute,
+    ];
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Role {
+    pub id: RoleId,
+    pub name: String,
+    /// Higher ranks can act on lower ones, never the other way round.
+    pub rank: u8,
+    pub perms: Vec<Perm>,
+    pub talk_power: u32,
+}
+
+impl Role {
+    pub fn can(&self, perm: Perm) -> bool {
+        self.perms.contains(&perm)
+    }
+}
+
+/// Someone who has been on the server, online or not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub key: Key,
+    pub name: String,
+    pub role: RoleId,
+    /// Unix seconds.
+    pub last_seen: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ban {
+    pub id: u32,
+    pub key: Option<Key>,
+    pub ip: Option<String>,
+    /// The name they had.
+    pub name: String,
+    pub reason: String,
+    pub by: String,
+    /// Unix seconds.
+    pub created: u64,
+    /// Unix seconds; None: for good.
+    pub until: Option<u64>,
+}
+
+/// A one-time code that gives whoever redeems it a role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Token {
+    pub token: String,
+    pub role: RoleId,
+    pub note: String,
+    pub created: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatTarget {
+    /// Everyone in the sender's channel.
+    Channel,
+    /// Everyone on the server.
+    Server,
+    /// One person (both sides get the message).
+    User(UserId),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewChannel {
+    pub parent: Option<ChannelId>,
+    pub name: String,
+    pub topic: String,
+    pub description: String,
+    pub password: Option<String>,
+    pub max_users: Option<u32>,
+    pub talk_power: u32,
+    pub permanent: bool,
+}
+
+/// Changes to a channel; None leaves a field as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelEdit {
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub description: Option<String>,
+    /// Some(None) removes the password.
+    pub password: Option<Option<String>>,
+    pub max_users: Option<Option<u32>>,
+    pub talk_power: Option<u32>,
+    pub permanent: Option<bool>,
+    /// Only `Some(true)` does something: the default moves here.
+    pub default: Option<bool>,
+}
+
+/// Changes to the server; None leaves a field as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerEdit {
+    pub name: Option<String>,
+    pub welcome: Option<String>,
+    pub max_users: Option<Option<u32>>,
+    /// Some(None) removes the password.
+    pub password: Option<Option<String>>,
+}
+
+/// Who the voice goes to while whispering.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Whisper {
+    pub channels: Vec<ChannelId>,
+    pub users: Vec<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,13 +237,124 @@ pub enum ClientMsg {
     Hello {
         protocol: u32,
         name: String,
+        key: Key,
+        /// Ed25519 over the TLS exporter output for [`IDENTITY_LABEL`].
+        signature: Vec<u8>,
+        password: Option<String>,
     },
     Join {
         channel: ChannelId,
+        password: Option<String>,
     },
-    /// Text to everyone in our channel.
     Chat {
+        to: ChatTarget,
         text: String,
+    },
+    Poke {
+        user: UserId,
+        text: String,
+    },
+    Rename {
+        name: String,
+    },
+    SetMuted {
+        input: bool,
+        output: bool,
+    },
+    SetAway(Option<String>),
+    SetDescription(String),
+    /// Some(message) asks for talk power; None takes the request back.
+    RequestTalk(Option<String>),
+    /// Voice goes here instead of our channel until set back to None.
+    SetWhisper(Option<Whisper>),
+
+    CreateChannel(NewChannel),
+    EditChannel {
+        id: ChannelId,
+        edit: ChannelEdit,
+    },
+    /// Put a channel under `parent`, right after `after` (None: first).
+    MoveChannel {
+        id: ChannelId,
+        parent: Option<ChannelId>,
+        after: Option<ChannelId>,
+    },
+    DeleteChannel {
+        id: ChannelId,
+    },
+
+    MoveUser {
+        user: UserId,
+        channel: ChannelId,
+    },
+    /// Out of their channel into the default one, or off the server.
+    Kick {
+        user: UserId,
+        reason: String,
+        server: bool,
+    },
+    Ban {
+        user: UserId,
+        reason: String,
+        /// None: for good.
+        secs: Option<u64>,
+    },
+    /// A ban for someone who isn't here, by key and/or IP.
+    AddBan {
+        key: Option<Key>,
+        ip: Option<String>,
+        reason: String,
+        secs: Option<u64>,
+    },
+    Unban {
+        id: u32,
+    },
+    ServerMute {
+        user: UserId,
+        muted: bool,
+    },
+    GrantTalk {
+        user: UserId,
+        granted: bool,
+    },
+    /// Give an account (online or not) a role.
+    SetRole {
+        key: Key,
+        role: RoleId,
+    },
+    /// Create (id 0) or change a role.
+    SaveRole(Role),
+    DeleteRole {
+        id: RoleId,
+    },
+    EditServer(ServerEdit),
+    CreateToken {
+        role: RoleId,
+        note: String,
+    },
+    DeleteToken {
+        token: String,
+    },
+    Redeem {
+        token: String,
+    },
+    ListBans,
+    ListAccounts,
+    ListTokens,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Leave {
+    Quit,
+    /// The connection timed out or broke.
+    Lost,
+    Kicked {
+        by: UserId,
+        reason: String,
+    },
+    Banned {
+        by: UserId,
+        reason: String,
     },
 }
 
@@ -54,20 +363,43 @@ pub enum ServerMsg {
     /// Answer to `Hello`: who we are and what the server looks like.
     Welcome {
         you: UserId,
+        server: ServerInfo,
         channels: Vec<Channel>,
         users: Vec<User>,
+        roles: Vec<Role>,
     },
+    /// Every channel, in display order (parents before children, siblings in order).
+    Channels(Vec<Channel>),
     UserJoined(User),
+    /// Anything about a user changed (channel, state, role...).
+    UserChanged(User),
     UserLeft {
         id: UserId,
-    },
-    UserMoved {
-        id: UserId,
-        channel: ChannelId,
+        reason: Leave,
     },
     Chat {
         from: UserId,
+        to: ChatTarget,
+        text: String,
+    },
+    Poke {
+        from: UserId,
+        text: String,
+    },
+    Roles(Vec<Role>),
+    Server(ServerInfo),
+    Bans(Vec<Ban>),
+    Accounts(Vec<Account>),
+    Tokens(Vec<Token>),
+    /// A token just made.
+    TokenCreated(Token),
+    /// A join was refused because of the channel's password.
+    NeedPassword {
         channel: ChannelId,
+        wrong: bool,
+    },
+    /// Something for us to read (kicked from a channel, token redeemed...).
+    Notice {
         text: String,
     },
     /// A request was refused. The connection stays up unless it was `Hello`.
@@ -123,10 +455,13 @@ where
 }
 
 /// Voice datagrams. Up: `seq (u16 LE) | opus`. Down: the server puts the
-/// speaker in front: `from (u32 LE) | seq (u16 LE) | opus`. The sequence
-/// number lets the receiver spot loss and reordering.
+/// speaker and a flags byte in front: `from (u32 LE) | seq (u16 LE) | flags | opus`.
+/// The sequence number lets the receiver spot loss and reordering.
 pub mod voice {
     use super::UserId;
+
+    /// The speaker is whispering to us rather than talking in the channel.
+    pub const WHISPER: u8 = 1;
 
     pub fn encode_up(seq: u16, opus: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + opus.len());
@@ -136,26 +471,30 @@ pub mod voice {
     }
 
     /// The datagram the server relays: the client's bytes behind the speaker id.
-    pub fn relay(from: UserId, up: &[u8]) -> Option<Vec<u8>> {
+    pub fn relay(from: UserId, flags: u8, up: &[u8]) -> Option<Vec<u8>> {
         if up.len() < 2 {
             return None;
         }
-        let mut out = Vec::with_capacity(4 + up.len());
+        let mut out = Vec::with_capacity(5 + up.len());
         out.extend_from_slice(&from.to_le_bytes());
-        out.extend_from_slice(up);
+        out.extend_from_slice(&up[..2]);
+        out.push(flags);
+        out.extend_from_slice(&up[2..]);
         Some(out)
     }
 
     pub struct Down<'a> {
         pub from: UserId,
         pub seq: u16,
+        pub whisper: bool,
         pub opus: &'a [u8],
     }
 
     pub fn decode_down(data: &[u8]) -> Option<Down<'_>> {
         let from = UserId::from_le_bytes(data.get(..4)?.try_into().ok()?);
         let seq = u16::from_le_bytes(data.get(4..6)?.try_into().ok()?);
-        Some(Down { from, seq, opus: &data[6..] })
+        let flags = *data.get(6)?;
+        Some(Down { from, seq, whisper: flags & WHISPER != 0, opus: &data[7..] })
     }
 }
 
@@ -166,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        let msg = ClientMsg::Hello { protocol: PROTOCOL_VERSION, name: "Rook".into() };
+        let msg = ClientMsg::Chat { to: ChatTarget::User(3), text: "hi".into() };
         write_msg(&mut a, &msg).await.unwrap();
         drop(a);
         assert_eq!(read_msg::<_, ClientMsg>(&mut b).await.unwrap(), msg);
@@ -183,9 +522,16 @@ mod tests {
     #[test]
     fn voice_relay() {
         let up = voice::encode_up(7, b"opus");
-        let down = voice::relay(42, &up).unwrap();
+        let down = voice::relay(42, voice::WHISPER, &up).unwrap();
         let d = voice::decode_down(&down).unwrap();
-        assert_eq!((d.from, d.seq, d.opus), (42, 7, &b"opus"[..]));
-        assert!(voice::relay(1, &[0]).is_none());
+        assert_eq!((d.from, d.seq, d.whisper, d.opus), (42, 7, true, &b"opus"[..]));
+        assert!(voice::relay(1, 0, &[0]).is_none());
+    }
+
+    #[test]
+    fn keys_as_hex() {
+        let key = [0xab; 32];
+        assert_eq!(parse_key(&key_hex(&key)), Some(key));
+        assert_eq!(parse_key("abc"), None);
     }
 }

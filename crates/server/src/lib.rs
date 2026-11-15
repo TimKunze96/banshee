@@ -1,7 +1,9 @@
-//! The Banshee server: one QUIC endpoint, channels, text chat, and voice
-//! relayed to everyone else in the speaker's channel.
+//! The Banshee server: one QUIC endpoint, a channel tree, roles and
+//! moderation, text chat, and voice relayed to whoever should hear it.
 
-use std::collections::HashMap;
+mod state;
+mod store;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -9,21 +11,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use banshee_proto::{
-    ALPN, Channel, ChannelId, ClientMsg, FrameError, PROTOCOL_VERSION, ServerMsg, User, UserId, read_msg, voice,
-    write_msg,
+    ALPN, ClientMsg, FrameError, IDENTITY_LABEL, Leave, PROTOCOL_VERSION, ServerMsg, read_msg, voice, write_msg,
 };
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use state::{Arrival, State};
+use store::Store;
+
 pub struct Config {
     pub bind: SocketAddr,
-    /// Where the server keeps its certificate.
+    /// Where the server keeps its certificate and state.
     pub data_dir: PathBuf,
-    /// Channel names; the first one is where people land.
+    /// Channels for a new server; the first one is where people land.
     pub channels: Vec<String>,
 }
 
@@ -33,26 +38,20 @@ pub struct Server {
     state: Arc<Mutex<State>>,
 }
 
-struct State {
-    channels: Vec<Channel>,
-    users: HashMap<UserId, Peer>,
-    next_id: UserId,
-}
-
-struct Peer {
-    user: User,
-    conn: quinn::Connection,
-    tx: mpsc::UnboundedSender<ServerMsg>,
-}
-
-const MAX_NAME: usize = 32;
-const MAX_CHAT: usize = 2000;
-
 impl Server {
     pub fn bind(config: Config) -> Result<Self> {
-        if config.channels.is_empty() {
-            bail!("the server needs at least one channel");
-        }
+        let store = match Store::load(&config.data_dir)? {
+            Some(store) if !store.channels.is_empty() => store,
+            Some(_) => bail!("the saved state has no channels"),
+            None => {
+                if config.channels.is_empty() {
+                    bail!("the server needs at least one channel");
+                }
+                let store = Store::fresh(&config.channels);
+                store.save(&config.data_dir)?;
+                store
+            }
+        };
         let (cert, key) = load_or_create_cert(&config.data_dir)?;
         let fingerprint = fingerprint(&cert);
 
@@ -69,8 +68,7 @@ impl Server {
 
         let endpoint =
             quinn::Endpoint::server(server_config, config.bind).with_context(|| format!("binding {}", config.bind))?;
-        let channels = config.channels.into_iter().zip(1..).map(|(name, id)| Channel { id, name }).collect();
-        let state = Arc::new(Mutex::new(State { channels, users: HashMap::new(), next_id: 1 }));
+        let state = Arc::new(Mutex::new(State::new(store, config.data_dir)));
         Ok(Self { endpoint, fingerprint, state })
     }
 
@@ -81,6 +79,11 @@ impl Server {
     /// SHA-256 of the certificate, hex. Clients pin it.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// The token that makes its redeemer admin, while nobody has used it.
+    pub fn admin_token(&self) -> Option<String> {
+        self.state.lock().unwrap().store.unused_admin_token().map(str::to_string)
     }
 
     /// Accept connections until the endpoint closes.
@@ -104,51 +107,42 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>) -> Result<(
     let hello = tokio::time::timeout(Duration::from_secs(10), read_msg::<_, ClientMsg>(&mut recv))
         .await
         .context("no hello")??;
-    let ClientMsg::Hello { protocol, name } = hello else { bail!("expected hello") };
-    let name = name.trim().to_string();
-    let refusal = if protocol != PROTOCOL_VERSION {
-        Some(format!("this server speaks protocol {PROTOCOL_VERSION}, not {protocol}"))
-    } else if name.is_empty() || name.chars().count() > MAX_NAME {
-        Some(format!("names need 1 to {MAX_NAME} characters"))
-    } else {
-        None
-    };
-    if let Some(message) = refusal {
-        write_msg(&mut send, &ServerMsg::Error { message: message.clone() }).await?;
-        let _ = send.finish();
-        let _ = send.stopped().await;
-        bail!(message);
-    }
+    let ClientMsg::Hello { protocol, name, key, signature, password } = hello else { bail!("expected hello") };
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let id = {
-        let mut s = state.lock().unwrap();
-        let id = s.next_id;
-        s.next_id += 1;
-        let user = User { id, name, channel: s.channels[0].id };
-        let welcome = ServerMsg::Welcome {
-            you: id,
-            channels: s.channels.clone(),
-            users: s.users.values().map(|p| p.user.clone()).chain([user.clone()]).collect(),
-        };
-        s.broadcast(|_| true, &ServerMsg::UserJoined(user.clone()));
-        let _ = tx.send(welcome);
-        s.users.insert(id, Peer { user, conn: conn.clone(), tx });
-        id
+    let admitted = if protocol != PROTOCOL_VERSION {
+        Err(format!("this server speaks protocol {PROTOCOL_VERSION}, not {protocol}"))
+    } else if !signed(&conn, &key, &signature) {
+        Err("the identity signature doesn't check out".into())
+    } else {
+        let ip = conn.remote_address().ip().to_canonical().to_string();
+        state.lock().unwrap().arrive(Arrival { key, name, password, ip, conn: conn.clone(), tx })
     };
-    info!(id, "joined");
+    let id = match admitted {
+        Ok(id) => id,
+        Err(message) => {
+            write_msg(&mut send, &ServerMsg::Error { message: message.clone() }).await?;
+            let _ = send.finish();
+            let _ = send.stopped().await;
+            bail!(message);
+        }
+    };
 
     let writer = async {
         while let Some(msg) = rx.recv().await {
             write_msg(&mut send, &msg).await?;
         }
-        anyhow::Ok(())
+        // the server let go of them (kick, ban): let them read why, then close
+        let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
+        conn.close(1u32.into(), b"removed");
+        anyhow::Ok(Leave::Quit)
     };
     let control = async {
         loop {
             match read_msg::<_, ClientMsg>(&mut recv).await {
                 Ok(msg) => state.lock().unwrap().handle(id, msg),
-                Err(FrameError::Closed) => return anyhow::Ok(()),
+                Err(FrameError::Closed) => return anyhow::Ok(Leave::Quit),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -158,7 +152,7 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>) -> Result<(
             match conn.read_datagram().await {
                 Ok(data) => relay(&state, id, &data),
                 // the client said goodbye
-                Err(quinn::ConnectionError::ApplicationClosed(_)) => return anyhow::Ok(()),
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => return anyhow::Ok(Leave::Quit),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -168,67 +162,35 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>) -> Result<(
         r = control => r,
         r = voice => r,
     };
-
-    let mut s = state.lock().unwrap();
-    s.users.remove(&id);
-    s.broadcast(|_| true, &ServerMsg::UserLeft { id });
-    info!(id, "left");
-    result
-}
-
-impl State {
-    fn handle(&mut self, id: UserId, msg: ClientMsg) {
-        match msg {
-            ClientMsg::Hello { .. } => self.reply(id, "already said hello"),
-            ClientMsg::Join { channel } => {
-                if !self.channels.iter().any(|c| c.id == channel) {
-                    return self.reply(id, "no such channel");
-                }
-                let Some(peer) = self.users.get_mut(&id) else { return };
-                if peer.user.channel == channel {
-                    return;
-                }
-                peer.user.channel = channel;
-                self.broadcast(|_| true, &ServerMsg::UserMoved { id, channel });
-            }
-            ClientMsg::Chat { text } => {
-                let text = text.trim();
-                if text.is_empty() || text.chars().count() > MAX_CHAT {
-                    return self.reply(id, &format!("messages need 1 to {MAX_CHAT} characters"));
-                }
-                let Some(channel) = self.channel_of(id) else { return };
-                let msg = ServerMsg::Chat { from: id, channel, text: text.to_string() };
-                self.broadcast(|p| p.user.channel == channel, &msg);
-            }
-        }
-    }
-
-    fn channel_of(&self, id: UserId) -> Option<ChannelId> {
-        self.users.get(&id).map(|p| p.user.channel)
-    }
-
-    fn reply(&self, id: UserId, message: &str) {
-        if let Some(p) = self.users.get(&id) {
-            let _ = p.tx.send(ServerMsg::Error { message: message.to_string() });
-        }
-    }
-
-    fn broadcast(&self, to: impl Fn(&Peer) -> bool, msg: &ServerMsg) {
-        for p in self.users.values().filter(|p| to(p)) {
-            let _ = p.tx.send(msg.clone());
-        }
-    }
-}
-
-/// Forward a voice datagram to everyone else in the speaker's channel.
-fn relay(state: &Mutex<State>, from: UserId, data: &[u8]) {
-    let Some(out) = voice::relay(from, data) else { return };
-    let out = Bytes::from(out);
-    let targets: Vec<quinn::Connection> = {
-        let s = state.lock().unwrap();
-        let Some(channel) = s.channel_of(from) else { return };
-        s.users.values().filter(|p| p.user.id != from && p.user.channel == channel).map(|p| p.conn.clone()).collect()
+    // the client closing shows up as an error on whichever read noticed first
+    let said_bye = matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(_)));
+    let result = if said_bye { Ok(Leave::Quit) } else { result };
+    let reason = match &result {
+        Ok(reason) => reason.clone(),
+        Err(_) => Leave::Lost,
     };
+    state.lock().unwrap().depart(id, reason);
+    result.map(|_| ())
+}
+
+/// The client holds the key: it signed this connection's keying material.
+fn signed(conn: &quinn::Connection, key: &[u8; 32], signature: &[u8]) -> bool {
+    let mut binding = [0u8; 32];
+    if conn.export_keying_material(&mut binding, IDENTITY_LABEL, b"").is_err() {
+        return false;
+    }
+    UnparsedPublicKey::new(&ED25519, key).verify(&binding, signature).is_ok()
+}
+
+/// Forward a voice datagram to whoever hears the speaker.
+fn relay(state: &Mutex<State>, from: u32, data: &[u8]) {
+    let (targets, whisper) = state.lock().unwrap().listeners(from);
+    if targets.is_empty() {
+        return;
+    }
+    let flags = if whisper { voice::WHISPER } else { 0 };
+    let Some(out) = voice::relay(from, flags, data) else { return };
+    let out = Bytes::from(out);
     for conn in targets {
         if let Err(e) = conn.send_datagram(out.clone()) {
             warn!("dropping voice for {}: {e}", conn.remote_address());
