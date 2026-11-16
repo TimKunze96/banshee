@@ -418,3 +418,57 @@ async fn offline_messages_and_the_log() {
     assert!(text.iter().any(|t| t.starts_with("B joined")), "{text:?}");
     assert!(text.contains(&"Admin redeemed a token for Admin"), "{text:?}");
 }
+
+#[tokio::test]
+async fn screen_sharing() {
+    let s = start("screens", false).await;
+    let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
+    let mut b = connect(&s, "B", &Identity::generate()).await.unwrap();
+    let (a_id, b_id) = (a.you, b.you);
+
+    // nothing to watch yet
+    b.send(ClientMsg::Watch { user: a_id });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Error { .. })).await;
+
+    let mut share = a.video().share().await.unwrap();
+    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.id == a_id && u.streaming)).await;
+    // a second share at once is refused
+    let _second = a.video().share().await.unwrap();
+    wait_for(&mut a, |e| matches!(e, ServerMsg::Error { message } if message.contains("already"))).await;
+
+    b.send(ClientMsg::Watch { user: a_id });
+    wait_for(&mut a, |e| matches!(e, ServerMsg::SendKeyframe)).await;
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    assert_eq!(watching.from, a_id);
+
+    // watchers start at a keyframe
+    share.send(false, b"p0").await.unwrap();
+    share.send(true, b"key").await.unwrap();
+    share.send(false, b"p1").await.unwrap();
+    let frame = |data: &[u8], keyframe| Some(banshee_client::Frame { keyframe, data: data.to_vec() });
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), frame(b"key", true));
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), frame(b"p1", false));
+
+    // a broken picture asks for a keyframe (at most one a second)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    b.send(ClientMsg::WantKeyframe { user: a_id });
+    wait_for(&mut a, |e| matches!(e, ServerMsg::SendKeyframe)).await;
+
+    // leaving the channel ends watching
+    let games = b.channels[1].id;
+    b.join(games);
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), None);
+    b.send(ClientMsg::Watch { user: a_id });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Error { message } if message.contains("own channel"))).await;
+    b.join(a.channels[0].id);
+    wait_for(&mut b, moved(b_id, a.channels[0].id)).await;
+    b.send(ClientMsg::Watch { user: a_id });
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    share.send(true, b"key2").await.unwrap();
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), frame(b"key2", true));
+
+    // stopping ends it for everyone
+    share.stop();
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), None);
+    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.id == a_id && !u.streaming)).await;
+}

@@ -3,7 +3,8 @@
 //! A client opens one QUIC connection. The first bidirectional stream carries
 //! control messages ([`ClientMsg`] up, [`ServerMsg`] down), each framed as a
 //! little-endian `u32` length followed by the postcard encoding. Voice goes
-//! as unreliable QUIC datagrams (see [`voice`]).
+//! as unreliable QUIC datagrams (see [`voice`]), screen sharing on
+//! unidirectional streams (see [`video`]).
 //!
 //! People are known by an Ed25519 key. `Hello` carries the public key and a
 //! signature over TLS keying material of this connection (see
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on incompatible changes; the server refuses other versions.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The ALPN both sides agree on.
 pub const ALPN: &[u8] = b"banshee/1";
@@ -96,6 +97,8 @@ pub struct User {
     pub talk_request: Option<String>,
     /// Hash of their picture (fetch it with [`transfer::Request::Avatar`]).
     pub avatar: Option<String>,
+    /// Sharing their screen (watch it with [`ClientMsg::Watch`]).
+    pub streaming: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -423,6 +426,19 @@ pub enum ClientMsg {
     ReadLog {
         lines: u32,
     },
+
+    /// Watch someone's screen in our channel. Their frames come on a stream
+    /// the server opens (see [`video`]).
+    Watch {
+        user: UserId,
+    },
+    Unwatch {
+        user: UserId,
+    },
+    /// Our picture of their stream broke; ask them for a keyframe.
+    WantKeyframe {
+        user: UserId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +509,8 @@ pub enum ServerMsg {
     },
     Inbox(Vec<OfflineMessage>),
     Log(Vec<LogLine>),
+    /// Someone started watching our screen or lost the picture: send a keyframe next.
+    SendKeyframe,
     /// A request was refused. The connection stays up unless it was `Hello`.
     Error {
         message: String,
@@ -667,5 +685,87 @@ mod tests {
         let key = [0xab; 32];
         assert_eq!(parse_key(&key_hex(&key)), Some(key));
         assert_eq!(parse_key("abc"), None);
+    }
+}
+
+/// Screen sharing. A client shares its screen by opening a unidirectional
+/// stream and writing [`KIND`] followed by frames; finishing the stream stops
+/// sharing. For each watcher the server opens a unidirectional stream with
+/// [`KIND`], the sharer's id (u32 LE), then the same frames. A frame is
+/// `len (u32 LE) | flags | H.264 Annex B data`. Watchers start at a keyframe,
+/// and the server skips frames for watchers that fall behind until the next one.
+pub mod video {
+    use super::{FrameError, UserId};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    /// First byte of a video stream.
+    pub const KIND: u8 = 1;
+    /// The frame can be decoded on its own.
+    pub const KEYFRAME: u8 = 1;
+    /// Biggest frame either side takes.
+    pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Frame {
+        pub keyframe: bool,
+        pub data: Vec<u8>,
+    }
+
+    /// A frame as it goes on the wire.
+    pub fn encode(keyframe: bool, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.push(if keyframe { KEYFRAME } else { 0 });
+        out.extend_from_slice(data);
+        out
+    }
+
+    pub async fn write<W: AsyncWrite + Unpin>(w: &mut W, keyframe: bool, data: &[u8]) -> Result<(), FrameError> {
+        if data.len() > MAX_FRAME as usize {
+            return Err(FrameError::TooBig(data.len() as u32));
+        }
+        w.write_all(&encode(keyframe, data)).await?;
+        Ok(())
+    }
+
+    /// The next frame; None when the stream ended between frames.
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, FrameError> {
+        let mut head = [0u8; 5];
+        match r.read_exact(&mut head[..1]).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        r.read_exact(&mut head[1..]).await?;
+        let len = u32::from_le_bytes(head[..4].try_into().unwrap());
+        if len > MAX_FRAME {
+            return Err(FrameError::TooBig(len));
+        }
+        let mut data = vec![0u8; len as usize];
+        r.read_exact(&mut data).await?;
+        Ok(Some(Frame { keyframe: head[4] & KEYFRAME != 0, data }))
+    }
+
+    /// Start of the stream the server opens to a watcher.
+    pub fn watcher_header(from: UserId) -> [u8; 5] {
+        let mut out = [KIND, 0, 0, 0, 0];
+        out[1..].copy_from_slice(&from.to_le_bytes());
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn frames() {
+            let mut buf = Vec::new();
+            write(&mut buf, true, b"key").await.unwrap();
+            write(&mut buf, false, b"").await.unwrap();
+            let mut r = &buf[..];
+            assert_eq!(read(&mut r).await.unwrap(), Some(Frame { keyframe: true, data: b"key".to_vec() }));
+            assert_eq!(read(&mut r).await.unwrap(), Some(Frame { keyframe: false, data: vec![] }));
+            assert_eq!(read(&mut r).await.unwrap(), None);
+        }
     }
 }

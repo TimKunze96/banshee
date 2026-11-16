@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 pub use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
+pub use banshee_proto::video::Frame;
 use banshee_proto::{ALPN, IDENTITY_LABEL, PROTOCOL_VERSION, read_msg, voice, write_msg};
 pub use banshee_proto::{
     Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, FileEntry, Key, Leave, LogLine, NewChannel,
@@ -191,6 +192,11 @@ impl Client {
         VoiceReceiver(self.conn.clone())
     }
 
+    /// Screen sharing; the handle can go to other tasks.
+    pub fn video(&self) -> Video {
+        Video(self.conn.clone())
+    }
+
     /// Leave, and wait until the server has been told.
     pub async fn close(self) {
         self.conn.close(0u32.into(), b"bye");
@@ -260,6 +266,61 @@ impl Upload {
             Reply::Refused { message } => bail!(message),
             Reply::Ready { .. } => bail!("unexpected answer"),
         }
+    }
+}
+
+/// Sharing our screen and receiving the screens we watch.
+#[derive(Clone)]
+pub struct Video(quinn::Connection);
+
+impl Video {
+    /// Start sharing. Frames go out with [`Share::send`]; dropping it or
+    /// [`Share::stop`] ends the share. The server says no with an `Error` message.
+    pub async fn share(&self) -> Result<Share> {
+        let mut send = self.0.open_uni().await?;
+        send.write_all(&[banshee_proto::video::KIND]).await?;
+        Ok(Share(send))
+    }
+
+    /// The next screen we get (after `ClientMsg::Watch`).
+    pub async fn next(&self) -> Result<Watching> {
+        loop {
+            let mut recv = self.0.accept_uni().await?;
+            let mut head = [0u8; 5];
+            if recv.read_exact(&mut head).await.is_err() || head[0] != banshee_proto::video::KIND {
+                let _ = recv.stop(0u32.into());
+                continue;
+            }
+            let from = UserId::from_le_bytes(head[1..].try_into().unwrap());
+            return Ok(Watching { from, recv });
+        }
+    }
+}
+
+pub struct Share(SendStream);
+
+impl Share {
+    /// One encoded frame (H.264 Annex B).
+    pub async fn send(&mut self, keyframe: bool, data: &[u8]) -> Result<()> {
+        banshee_proto::video::write(&mut self.0, keyframe, data).await?;
+        Ok(())
+    }
+
+    pub fn stop(mut self) {
+        let _ = self.0.finish();
+    }
+}
+
+/// Someone's screen, as it arrives. It starts with a keyframe.
+pub struct Watching {
+    pub from: UserId,
+    recv: RecvStream,
+}
+
+impl Watching {
+    /// The next frame; None once they stop sharing or we stop watching.
+    pub async fn frame(&mut self) -> Result<Option<Frame>> {
+        Ok(banshee_proto::video::read(&mut self.recv).await?)
     }
 }
 

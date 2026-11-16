@@ -8,9 +8,9 @@ What works: a channel tree with passwords, user limits, talk power and
 temporary channels; channel, server and private chat; pokes; whispering;
 roles with permissions (Admin, Moderator, Member and Guest to start with, all
 editable); kicks, bans and server mutes; one-time tokens that hand out roles;
-channel files; avatars; offline messages and a server log.
-Everything runs over QUIC (encrypted, one UDP port). Voice is Opus; the
-server only forwards it and never decodes anything.
+channel files; avatars; offline messages and a server log; screen sharing.
+Everything runs over QUIC (encrypted, one UDP port). Voice is Opus and
+screens are H.264; the server only forwards them and never decodes anything.
 
 People are known by a key their client makes and keeps, so roles and bans
 stick across reconnects and name changes.
@@ -59,13 +59,9 @@ is kept in `banshee-identity.der`.
 
 ## Layout
 
-- `crates/proto`: the wire protocol (control messages, framing, voice datagrams)
+- `crates/proto`: the wire protocol (control messages, framing, voice datagrams, video streams)
 - `crates/server`: the server
 - `crates/client`: a client library (for Wisp) and `banshee-cli`
-
-## Next
-
-Screen sharing and streaming.
 
 ## License
 

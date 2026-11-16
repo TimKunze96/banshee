@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use banshee_proto::{
     Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, Key, Leave, NewChannel, Perm, Role, RoleId,
-    ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex,
+    ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex, video,
 };
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -20,6 +22,10 @@ const MAX_TOPIC: usize = 255;
 const MAX_DESCRIPTION: usize = 8000;
 const MAX_SHORT: usize = 200;
 const MAX_WHISPER: usize = 64;
+/// Frames waiting for a watcher before they start getting skipped.
+const WATCHER_QUEUE: usize = 4;
+/// Keyframes are big; don't ask a sharer for more than one this often.
+const KEYFRAME_EVERY: Duration = Duration::from_secs(1);
 
 pub struct State {
     pub db: Db,
@@ -44,6 +50,15 @@ pub struct Peer {
     pub tx: mpsc::UnboundedSender<ServerMsg>,
     pub ip: String,
     pub whisper: Option<Whisper>,
+    /// Who watches their screen.
+    watchers: HashMap<UserId, Watcher>,
+    asked_keyframe: Option<Instant>,
+}
+
+struct Watcher {
+    tx: mpsc::Sender<Bytes>,
+    /// Skipping frames until the next keyframe.
+    waiting: bool,
 }
 
 /// Who connects, once their identity checked out.
@@ -244,6 +259,7 @@ impl State {
             talk_granted: false,
             talk_request: None,
             avatar,
+            streaming: false,
         };
         let welcome = ServerMsg::Welcome {
             you: id,
@@ -262,7 +278,16 @@ impl State {
             let _ = a.tx.send(ServerMsg::Notice { text });
         }
         self.log(format!("{} joined ({}, {})", user.name, key_hex(&a.key), a.ip));
-        self.users.insert(id, Peer { user, conn: a.conn, tx: a.tx, ip: a.ip, whisper: None });
+        let peer = Peer {
+            user,
+            conn: a.conn,
+            tx: a.tx,
+            ip: a.ip,
+            whisper: None,
+            watchers: HashMap::new(),
+            asked_keyframe: None,
+        };
+        self.users.insert(id, peer);
         Ok(id)
     }
 
@@ -291,6 +316,7 @@ impl State {
             };
             self.log(format!("{} left{why}", p.user.name));
             self.broadcast(|_| true, &ServerMsg::UserLeft { id, reason });
+            self.prune_watchers();
             self.drop_empty_channels();
         }
     }
@@ -535,6 +561,19 @@ impl State {
                 stored(self.db.delete_offline(&self.user(id)?.key, message))?;
                 self.send_inbox(id)
             }
+            ClientMsg::Watch { user } => self.watch(id, user),
+            ClientMsg::Unwatch { user } => {
+                if let Some(p) = self.users.get_mut(&user) {
+                    p.watchers.remove(&id);
+                }
+                Ok(())
+            }
+            ClientMsg::WantKeyframe { user } => {
+                if self.users.get(&user).is_some_and(|p| p.watchers.contains_key(&id)) {
+                    self.ask_keyframe(user, false);
+                }
+                Ok(())
+            }
             ClientMsg::ReadLog { lines } => {
                 self.may(id, Perm::ManageServer)?;
                 self.send(id, ServerMsg::Log(stored(self.db.read_log(lines.min(10_000)))?));
@@ -612,6 +651,7 @@ impl State {
         }
         p.user.channel = channel;
         self.changed(id);
+        self.prune_watchers();
         self.drop_empty_channels();
     }
 
@@ -959,6 +999,99 @@ impl State {
         Ok(())
     }
 
+    /// Their screen stream opened.
+    pub fn start_stream(&mut self, id: UserId) -> Outcome {
+        let user = self.user(id)?;
+        if user.streaming {
+            return Err("you're already sharing your screen".into());
+        }
+        if user.server_muted {
+            return Err("you're muted on this server".into());
+        }
+        self.update(id, |u| u.streaming = true)?;
+        self.log(format!("{} started sharing their screen", self.name(id)));
+        Ok(())
+    }
+
+    /// Their screen stream ended; watchers' streams end with it.
+    pub fn stop_stream(&mut self, id: UserId) {
+        let Some(p) = self.users.get_mut(&id) else { return };
+        p.watchers.clear();
+        if p.user.streaming {
+            let _ = self.update(id, |u| u.streaming = false);
+            self.log(format!("{} stopped sharing their screen", self.name(id)));
+        }
+    }
+
+    fn watch(&mut self, id: UserId, user: UserId) -> Outcome {
+        if id == user {
+            return Err("that's your own screen".into());
+        }
+        let sharer = self.user(user)?;
+        if !sharer.streaming {
+            return Err("they aren't sharing their screen".into());
+        }
+        if sharer.channel != self.user(id)?.channel {
+            return Err("you can only watch screens in your own channel".into());
+        }
+        if self.users[&user].watchers.contains_key(&id) {
+            return Ok(());
+        }
+        let conn = self.users[&id].conn.clone();
+        let (tx, rx) = mpsc::channel(WATCHER_QUEUE);
+        tokio::spawn(forward(conn, user, rx));
+        self.users.get_mut(&user).unwrap().watchers.insert(id, Watcher { tx, waiting: true });
+        self.ask_keyframe(user, true);
+        Ok(())
+    }
+
+    /// Pass a frame on to everyone watching `from`. Watchers that fall
+    /// behind skip frames until the next keyframe.
+    pub fn relay_frame(&mut self, from: UserId, frame: video::Frame) {
+        let Some(p) = self.users.get_mut(&from) else { return };
+        if p.watchers.is_empty() {
+            return;
+        }
+        let bytes = Bytes::from(video::encode(frame.keyframe, &frame.data));
+        let mut ask = false;
+        p.watchers.retain(|_, w| {
+            if w.waiting && !frame.keyframe {
+                ask = true;
+                return true;
+            }
+            match w.tx.try_send(bytes.clone()) {
+                Ok(()) => w.waiting = false,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    w.waiting = true;
+                    ask = true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+            true
+        });
+        if ask {
+            self.ask_keyframe(from, false);
+        }
+    }
+
+    fn ask_keyframe(&mut self, from: UserId, now: bool) {
+        let Some(p) = self.users.get_mut(&from) else { return };
+        if !now && p.asked_keyframe.is_some_and(|t| t.elapsed() < KEYFRAME_EVERY) {
+            return;
+        }
+        p.asked_keyframe = Some(Instant::now());
+        let _ = p.tx.send(ServerMsg::SendKeyframe);
+    }
+
+    /// People only watch screens in their own channel.
+    fn prune_watchers(&mut self) {
+        let channels: HashMap<UserId, ChannelId> = self.users.values().map(|p| (p.user.id, p.user.channel)).collect();
+        for p in self.users.values_mut() {
+            let channel = p.user.channel;
+            p.watchers.retain(|w, _| channels.get(w) == Some(&channel));
+        }
+    }
+
     /// Who hears a voice datagram from `from` (and whether it's a whisper),
     /// or nobody when they may not talk.
     pub fn listeners(&self, from: UserId) -> (Vec<quinn::Connection>, bool) {
@@ -1004,4 +1137,19 @@ fn limit(text: &str, max: usize, what: &str) -> Result<String, String> {
         true => Ok(text.to_string()),
         false => Err(format!("{what} can be {max} characters at most")),
     }
+}
+
+/// Copy a sharer's frames onto a stream to one watcher, until they stop
+/// watching (the sender goes away) or the stream breaks.
+async fn forward(conn: quinn::Connection, from: UserId, mut frames: mpsc::Receiver<Bytes>) {
+    let Ok(mut send) = conn.open_uni().await else { return };
+    if send.write_all(&video::watcher_header(from)).await.is_err() {
+        return;
+    }
+    while let Some(frame) = frames.recv().await {
+        if send.write_chunk(frame).await.is_err() {
+            return;
+        }
+    }
+    let _ = send.finish();
 }

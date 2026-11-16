@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
 use banshee_proto::{
-    ALPN, ClientMsg, FrameError, IDENTITY_LABEL, Leave, PROTOCOL_VERSION, Perm, ServerMsg, UserId, read_msg, voice,
-    write_msg,
+    ALPN, ClientMsg, FrameError, IDENTITY_LABEL, Leave, PROTOCOL_VERSION, Perm, ServerMsg, UserId, read_msg, video,
+    voice, write_msg,
 };
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -168,11 +168,26 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>, max_file: u
         #[allow(unreachable_code)]
         anyhow::Ok(Leave::Quit)
     };
+    // screen sharing
+    let shares = async {
+        loop {
+            let recv = conn.accept_uni().await?;
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = share(&state, id, recv).await {
+                    info!(id, "screen share ended: {e:#}");
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(Leave::Quit)
+    };
     let result = tokio::select! {
         r = writer => r,
         r = control => r,
         r = voice => r,
         r = streams => r,
+        r = shares => r,
     };
     // the client closing shows up as an error on whichever read noticed first
     let said_bye = matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(_)));
@@ -183,6 +198,31 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>, max_file: u
     };
     state.lock().unwrap().depart(id, reason);
     result.map(|_| ())
+}
+
+/// Someone's screen, until they finish the stream (see `banshee_proto::video`).
+async fn share(state: &Mutex<State>, id: UserId, mut recv: quinn::RecvStream) -> Result<()> {
+    let mut kind = [0u8];
+    recv.read_exact(&mut kind).await?;
+    if kind[0] != video::KIND {
+        let _ = recv.stop(0u32.into());
+        bail!("unknown stream kind {}", kind[0]);
+    }
+    let started = state.lock().unwrap().start_stream(id);
+    if let Err(message) = started {
+        state.lock().unwrap().send(id, ServerMsg::Error { message });
+        let _ = recv.stop(0u32.into());
+        return Ok(());
+    }
+    let result = async {
+        while let Some(frame) = video::read(&mut recv).await? {
+            state.lock().unwrap().relay_frame(id, frame);
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    state.lock().unwrap().stop_stream(id);
+    result
 }
 
 /// One file transfer (see `banshee_proto::transfer`).
