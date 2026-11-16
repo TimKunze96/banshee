@@ -1034,9 +1034,7 @@ impl State {
         if sharer.channel != self.user(id)?.channel {
             return Err("you can only watch screens in your own channel".into());
         }
-        if self.users[&user].watchers.contains_key(&id) {
-            return Ok(());
-        }
+        // watching again replaces the old stream (the client lost track of it)
         let conn = self.users[&id].conn.clone();
         let (tx, rx) = mpsc::channel(WATCHER_QUEUE);
         tokio::spawn(forward(conn, user, rx));

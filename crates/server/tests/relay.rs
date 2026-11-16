@@ -467,6 +467,14 @@ async fn screen_sharing() {
     share.send(true, b"key2").await.unwrap();
     assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), frame(b"key2", true));
 
+    // watching again replaces the stream
+    b.send(ClientMsg::Watch { user: a_id });
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), None);
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    wait_for(&mut a, |e| matches!(e, ServerMsg::SendKeyframe)).await;
+    share.send(true, b"key3").await.unwrap();
+    assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), frame(b"key3", true));
+
     // stopping ends it for everyone
     share.stop();
     assert_eq!(tokio::time::timeout(WAIT, watching.frame()).await.unwrap().unwrap(), None);
