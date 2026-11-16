@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 pub use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
-pub use banshee_proto::video::{AUDIO, Packet};
+pub use banshee_proto::video::{AUDIO, MAX_LAYERS, Packet};
 use banshee_proto::{ALPN, IDENTITY_LABEL, PROTOCOL_VERSION, read_msg, voice, write_msg};
 pub use banshee_proto::{
     Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, FileEntry, Key, Layer, Leave, LogLine,
