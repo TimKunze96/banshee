@@ -3,6 +3,7 @@
 
 mod db;
 mod files;
+mod screens;
 mod state;
 
 use std::net::SocketAddr;
@@ -208,15 +209,18 @@ async fn share(state: &Mutex<State>, id: UserId, mut recv: quinn::RecvStream) ->
         let _ = recv.stop(0u32.into());
         bail!("unknown stream kind {}", kind[0]);
     }
-    let started = state.lock().unwrap().start_stream(id);
+    let info = tokio::time::timeout(Duration::from_secs(10), read_msg::<_, banshee_proto::StreamInfo>(&mut recv))
+        .await
+        .context("no stream info")??;
+    let started = state.lock().unwrap().start_stream(id, info);
     if let Err(message) = started {
         state.lock().unwrap().send(id, ServerMsg::Error { message });
         let _ = recv.stop(0u32.into());
         return Ok(());
     }
     let result = async {
-        while let Some(frame) = video::read(&mut recv).await? {
-            state.lock().unwrap().relay_frame(id, frame);
+        while let Some(packet) = video::read(&mut recv).await? {
+            state.lock().unwrap().relay_packet(id, packet);
         }
         anyhow::Ok(())
     }

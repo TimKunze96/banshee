@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 pub use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
-pub use banshee_proto::video::Frame;
+pub use banshee_proto::video::{AUDIO, Packet};
 use banshee_proto::{ALPN, IDENTITY_LABEL, PROTOCOL_VERSION, read_msg, voice, write_msg};
 pub use banshee_proto::{
-    Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, FileEntry, Key, Leave, LogLine, NewChannel,
-    OfflineMessage, Perm, Role, RoleId, ServerEdit, ServerInfo, ServerMsg, Token, User, UserId, Whisper, key_hex,
-    parse_key,
+    Account, Ban, Channel, ChannelEdit, ChannelId, ChatTarget, ClientMsg, FileEntry, Key, Layer, Leave, LogLine,
+    NewChannel, OfflineMessage, Perm, Quality, Role, RoleId, ServerEdit, ServerInfo, ServerMsg, StreamInfo, Token,
+    User, UserId, Whisper, key_hex, parse_key,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 pub use quinn::{RecvStream, SendStream};
@@ -274,11 +274,12 @@ impl Upload {
 pub struct Video(quinn::Connection);
 
 impl Video {
-    /// Start sharing. Frames go out with [`Share::send`]; dropping it or
+    /// Start sharing. Packets go out with [`Share::send`]; dropping it or
     /// [`Share::stop`] ends the share. The server says no with an `Error` message.
-    pub async fn share(&self) -> Result<Share> {
+    pub async fn share(&self, info: &StreamInfo) -> Result<Share> {
         let mut send = self.0.open_uni().await?;
         send.write_all(&[banshee_proto::video::KIND]).await?;
+        write_msg(&mut send, info).await?;
         Ok(Share(send))
     }
 
@@ -300,9 +301,9 @@ impl Video {
 pub struct Share(SendStream);
 
 impl Share {
-    /// One encoded frame (H.264 Annex B).
-    pub async fn send(&mut self, keyframe: bool, data: &[u8]) -> Result<()> {
-        banshee_proto::video::write(&mut self.0, keyframe, data).await?;
+    /// A video frame (H.264 Annex B, on the track of its layer) or sound.
+    pub async fn send(&mut self, packet: &Packet) -> Result<()> {
+        banshee_proto::video::write(&mut self.0, packet).await?;
         Ok(())
     }
 
@@ -318,8 +319,8 @@ pub struct Watching {
 }
 
 impl Watching {
-    /// The next frame; None once they stop sharing or we stop watching.
-    pub async fn frame(&mut self) -> Result<Option<Frame>> {
+    /// The next packet; None once they stop sharing or we stop watching.
+    pub async fn packet(&mut self) -> Result<Option<Packet>> {
         Ok(banshee_proto::video::read(&mut self.recv).await?)
     }
 }
