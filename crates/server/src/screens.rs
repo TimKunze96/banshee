@@ -83,7 +83,9 @@ impl Watcher {
         self.patience = PATIENCE;
         let target = match quality {
             Quality::Layer(_) => start_layer(quality, layers),
-            Quality::Auto => self.layer,
+            // from a thumbnail's smallest layer straight to Auto's start;
+            // already better than that, stay
+            Quality::Auto => self.layer.min(start_layer(quality, layers)),
         };
         self.retarget(target)
     }
