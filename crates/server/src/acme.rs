@@ -258,7 +258,11 @@ pub struct Files {
 }
 
 /// The certificate in the files, and when they were last written.
-pub fn read_files(cert: &std::path::Path, key: &std::path::Path, provider: &CryptoProvider) -> Result<(CertifiedKey, SystemTime)> {
+pub fn read_files(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    provider: &CryptoProvider,
+) -> Result<(CertifiedKey, SystemTime)> {
     let written = |p: &std::path::Path| -> Result<SystemTime> {
         std::fs::metadata(p).and_then(|m| m.modified()).with_context(|| format!("reading {}", p.display()))
     };
@@ -278,10 +282,7 @@ pub async fn watch_files(files: Files) {
     let Files { cert, key, certs, provider, mut loaded } = files;
     let mut complained = false;
     loop {
-        let written = [&cert, &key]
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
-            .max();
+        let written = [&cert, &key].iter().filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).max();
         if written.is_some() && written != loaded {
             match read_files(&cert, &key, &provider) {
                 Ok((k, when)) => {
