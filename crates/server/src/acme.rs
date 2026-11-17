@@ -25,6 +25,9 @@ use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};
 
+/// How often certificate files from elsewhere are checked for a new one.
+const FILES_EVERY: Duration = Duration::from_secs(5 * 60);
+
 /// Renew when the certificate is this old.
 const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 3600);
 /// Wait this long after a failed attempt.
@@ -243,9 +246,80 @@ async fn serve_challenges(listener: tokio::net::TcpListener, tokens: Arc<Mutex<H
     }
 }
 
+/// A certificate someone else keeps fresh (a reverse proxy's Let's Encrypt,
+/// certbot...), as PEM files: `BANSHEE_TLS_CERT` and `BANSHEE_TLS_KEY`.
+pub struct Files {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub certs: Arc<Certs>,
+    pub provider: Arc<CryptoProvider>,
+    /// When the files we use were written (None: not loaded yet).
+    pub loaded: Option<SystemTime>,
+}
+
+/// The certificate in the files, and when they were last written.
+pub fn read_files(cert: &std::path::Path, key: &std::path::Path, provider: &CryptoProvider) -> Result<(CertifiedKey, SystemTime)> {
+    let written = |p: &std::path::Path| -> Result<SystemTime> {
+        std::fs::metadata(p).and_then(|m| m.modified()).with_context(|| format!("reading {}", p.display()))
+    };
+    let when = written(cert)?.max(written(key)?);
+    let chain_pem = std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?;
+    let key_pem = std::fs::read(key).with_context(|| format!("reading {}", key.display()))?;
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(&chain_pem).collect::<Result<_, _>>()?;
+    if chain.is_empty() {
+        bail!("no certificate in {}", cert.display());
+    }
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).with_context(|| format!("no key in {}", key.display()))?;
+    Ok((certified(chain, key, provider)?, when))
+}
+
+/// Swap in the files' certificate whenever they change. Runs as long as the server.
+pub async fn watch_files(files: Files) {
+    let Files { cert, key, certs, provider, mut loaded } = files;
+    let mut complained = false;
+    loop {
+        let written = [&cert, &key]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .max();
+        if written.is_some() && written != loaded {
+            match read_files(&cert, &key, &provider) {
+                Ok((k, when)) => {
+                    certs.set(k);
+                    loaded = Some(when);
+                    complained = false;
+                    info!(cert = %cert.display(), "loaded the certificate");
+                }
+                Err(e) if !complained => {
+                    complained = true;
+                    error!("can't use the certificate files: {e:#} (still checking)");
+                }
+                Err(_) => {}
+            }
+        }
+        tokio::time::sleep(FILES_EVERY).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Certificate files load, and a broken key is an error.
+    #[test]
+    fn reads_files() {
+        let dir = std::env::temp_dir().join(format!("banshee-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec!["voice.example.com".into()]).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        let provider = rustls::crypto::ring::default_provider();
+        assert!(read_files(&cert, &key, &provider).is_ok());
+        std::fs::write(&key, "nope").unwrap();
+        assert!(read_files(&cert, &key, &provider).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The challenge server answers known tokens, 404s the rest.
     #[tokio::test]

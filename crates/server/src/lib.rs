@@ -40,6 +40,8 @@ pub struct Config {
     pub max_file: u64,
     /// A Let's Encrypt certificate for a domain, instead of the self-signed one.
     pub acme: Option<acme::AcmeConfig>,
+    /// Or a certificate kept fresh by something else: (cert, key) PEM files.
+    pub tls_files: Option<(PathBuf, PathBuf)>,
 }
 
 pub struct Server {
@@ -47,6 +49,8 @@ pub struct Server {
     fingerprint: String,
     /// Keeps the Let's Encrypt certificate fresh, started with `run`.
     acme: Option<acme::Renewal>,
+    /// Or watches certificate files, started with `run`.
+    files: Option<acme::Files>,
     state: Arc<Mutex<State>>,
     max_file: u64,
 }
@@ -58,8 +62,20 @@ impl Server {
         let fingerprint = fingerprint(&cert);
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        // the Let's Encrypt one when we have it; self-signed until then
-        let saved = config.acme.as_ref().and_then(|_| acme::load(&config.data_dir, &provider));
+        // the files', or the Let's Encrypt one when we have it; self-signed until then
+        let from_files = config.tls_files.as_ref().and_then(|(c, k)| match acme::read_files(c, k, &provider) {
+            Ok(loaded) => Some(loaded),
+            Err(e) => {
+                tracing::error!("can't use the certificate files yet: {e:#}");
+                None
+            }
+        });
+        let loaded = from_files.as_ref().map(|(_, t)| *t);
+        let saved = match (&config.tls_files, &config.acme) {
+            (Some(_), _) => from_files,
+            (None, Some(_)) => acme::load(&config.data_dir, &provider),
+            (None, None) => None,
+        };
         let issued = saved.as_ref().map(|(_, t)| *t);
         let first = match saved {
             Some((key, _)) => key,
@@ -79,9 +95,22 @@ impl Server {
         let endpoint =
             quinn::Endpoint::server(server_config, config.bind).with_context(|| format!("binding {}", config.bind))?;
         let state = Arc::new(Mutex::new(State::new(db, config.data_dir.clone())?));
-        let acme =
-            config.acme.map(|a| acme::Renewal { config: a, data: config.data_dir.clone(), certs, provider, issued });
-        Ok(Self { endpoint, fingerprint, acme, state, max_file: config.max_file })
+        let files = config.tls_files.map(|(cert, key)| acme::Files {
+            cert,
+            key,
+            certs: certs.clone(),
+            provider: provider.clone(),
+            loaded,
+        });
+        // files win: something else already looks after the certificate
+        let acme = config.acme.filter(|_| files.is_none()).map(|a| acme::Renewal {
+            config: a,
+            data: config.data_dir.clone(),
+            certs,
+            provider,
+            issued,
+        });
+        Ok(Self { endpoint, fingerprint, acme, files, state, max_file: config.max_file })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -102,6 +131,9 @@ impl Server {
     pub async fn run(mut self) {
         if let Some(renewal) = self.acme.take() {
             tokio::spawn(acme::run(renewal));
+        }
+        if let Some(files) = self.files.take() {
+            tokio::spawn(acme::watch_files(files));
         }
         while let Some(incoming) = self.endpoint.accept().await {
             let state = self.state.clone();
