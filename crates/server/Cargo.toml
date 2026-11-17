@@ -10,6 +10,7 @@ publish.workspace = true
 anyhow = "1.0.104"
 banshee-proto = { version = "0.1.0", path = "../proto" }
 bytes = "1.12.1"
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 quinn = "0.11.12"
 rcgen = "0.14.10"
 ring = "0.17"

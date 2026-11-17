@@ -1,6 +1,7 @@
 //! The Banshee server: one QUIC endpoint, a channel tree, roles and
 //! moderation, text chat, and voice relayed to whoever should hear it.
 
+pub mod acme;
 mod db;
 mod files;
 mod screens;
@@ -37,11 +38,15 @@ pub struct Config {
     pub channels: Vec<String>,
     /// Biggest file people can upload, in bytes.
     pub max_file: u64,
+    /// A Let's Encrypt certificate for a domain, instead of the self-signed one.
+    pub acme: Option<acme::AcmeConfig>,
 }
 
 pub struct Server {
     endpoint: quinn::Endpoint,
     fingerprint: String,
+    /// Keeps the Let's Encrypt certificate fresh, started with `run`.
+    acme: Option<acme::Renewal>,
     state: Arc<Mutex<State>>,
     max_file: u64,
 }
@@ -53,10 +58,18 @@ impl Server {
         let fingerprint = fingerprint(&cert);
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        // the Let's Encrypt one when we have it; self-signed until then
+        let saved = config.acme.as_ref().and_then(|_| acme::load(&config.data_dir, &provider));
+        let issued = saved.as_ref().map(|(_, t)| *t);
+        let first = match saved {
+            Some((key, _)) => key,
+            None => acme::certified(vec![cert], key, &provider)?,
+        };
+        let certs = Arc::new(acme::Certs::new(first));
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
-            .with_single_cert(vec![cert], key)?;
+            .with_cert_resolver(certs.clone());
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
         let mut transport = quinn::TransportConfig::default();
@@ -65,8 +78,10 @@ impl Server {
 
         let endpoint =
             quinn::Endpoint::server(server_config, config.bind).with_context(|| format!("binding {}", config.bind))?;
-        let state = Arc::new(Mutex::new(State::new(db, config.data_dir)?));
-        Ok(Self { endpoint, fingerprint, state, max_file: config.max_file })
+        let state = Arc::new(Mutex::new(State::new(db, config.data_dir.clone())?));
+        let acme =
+            config.acme.map(|a| acme::Renewal { config: a, data: config.data_dir.clone(), certs, provider, issued });
+        Ok(Self { endpoint, fingerprint, acme, state, max_file: config.max_file })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -84,7 +99,10 @@ impl Server {
     }
 
     /// Accept connections until the endpoint closes.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
+        if let Some(renewal) = self.acme.take() {
+            tokio::spawn(acme::run(renewal));
+        }
         while let Some(incoming) = self.endpoint.accept().await {
             let state = self.state.clone();
             let max_file = self.max_file;

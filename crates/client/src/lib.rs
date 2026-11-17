@@ -65,9 +65,12 @@ impl Identity {
 pub struct Options<'a> {
     pub name: &'a str,
     pub identity: &'a Identity,
-    /// The server's certificate fingerprint; None takes any (first use).
+    /// The server's self-signed certificate fingerprint. Without one, the
+    /// certificate has to be valid for `server_name` (Let's Encrypt).
     pub fingerprint: Option<&'a str>,
     pub password: Option<&'a str>,
+    /// The name the server's certificate is for: the domain in the link.
+    pub server_name: Option<&'a str>,
 }
 
 pub struct Client {
@@ -112,7 +115,8 @@ impl Client {
         let local: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
         let mut endpoint = quinn::Endpoint::client(local)?;
         endpoint.set_default_client_config(config);
-        let conn = endpoint.connect(addr, "banshee")?.await.with_context(|| format!("connecting to {addr}"))?;
+        let name = opts.server_name.unwrap_or("banshee");
+        let conn = endpoint.connect(addr, name)?.await.with_context(|| format!("connecting to {addr}"))?;
         let fingerprint = verifier.seen().unwrap_or_default();
 
         let mut binding = [0u8; 32];
@@ -339,18 +343,25 @@ impl VoiceReceiver {
     }
 }
 
-/// Takes the server's self-signed certificate if it matches the pinned
-/// fingerprint (or any, when none is pinned). Signatures are still checked.
+/// Takes a certificate that's valid for the server's name (Let's Encrypt),
+/// or a self-signed one matching the pinned fingerprint. A valid one wins
+/// over the pin, so renewals don't break saved links.
 #[derive(Debug)]
 struct Pinned {
     expected: Option<String>,
     seen: std::sync::Mutex<Option<String>>,
     provider: Arc<CryptoProvider>,
+    trusted: Arc<rustls::client::WebPkiServerVerifier>,
 }
 
 impl Pinned {
     fn new(expected: Option<String>) -> Self {
-        Self { expected, seen: Default::default(), provider: Arc::new(rustls::crypto::ring::default_provider()) }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let trusted = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .build()
+            .expect("the bundled root certificates are valid");
+        Self { expected, seen: Default::default(), provider, trusted }
     }
 
     fn seen(&self) -> Option<String> {
@@ -362,17 +373,25 @@ impl ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let fp: String = Sha256::digest(end_entity).iter().map(|b| format!("{b:02x}")).collect();
-        if self.expected.as_ref().is_some_and(|e| *e != fp) {
-            return Err(rustls::Error::General(format!("certificate fingerprint {fp} doesn't match the pinned one")));
+        *self.seen.lock().unwrap() = Some(fp.clone());
+        if let Ok(ok) = self.trusted.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+            return Ok(ok);
         }
-        *self.seen.lock().unwrap() = Some(fp);
-        Ok(ServerCertVerified::assertion())
+        match &self.expected {
+            Some(e) if *e == fp => Ok(ServerCertVerified::assertion()),
+            Some(_) => {
+                Err(rustls::Error::General(format!("certificate fingerprint {fp} doesn't match the pinned one")))
+            }
+            None => Err(rustls::Error::General(
+                "the server's certificate isn't valid for this address; use the link with its #fingerprint".into(),
+            )),
+        }
     }
 
     fn verify_tls12_signature(

@@ -20,7 +20,13 @@ async fn main() -> Result<()> {
     };
     let addr = tokio::net::lookup_host(addr).await?.next().context("no address for that host")?;
     let identity = Identity::load_or_create("banshee-identity.der".as_ref())?;
-    let opts = Options { name, identity: &identity, fingerprint: rest.first().map(String::as_str), password: None };
+    let opts = Options {
+        name,
+        identity: &identity,
+        fingerprint: rest.first().map(String::as_str),
+        password: None,
+        server_name: None,
+    };
     let mut client = Client::connect(addr, opts).await?;
     println!("connected, server fingerprint {}", client.fingerprint);
     for c in &client.channels {

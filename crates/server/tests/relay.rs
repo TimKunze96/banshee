@@ -34,6 +34,7 @@ async fn start(name: &str, keep: bool) -> Running {
         data_dir: dir,
         channels: vec!["Lobby".into(), "Games".into()],
         max_file: 1_000_000,
+        acme: None,
     })
     .unwrap();
     let (addr, fp, token) = (server.local_addr().unwrap(), server.fingerprint().to_string(), server.admin_token());
@@ -41,7 +42,8 @@ async fn start(name: &str, keep: bool) -> Running {
 }
 
 async fn connect(s: &Running, name: &str, id: &Identity) -> anyhow::Result<Client> {
-    Client::connect(s.addr, Options { name, identity: id, fingerprint: Some(&s.fp), password: None }).await
+    Client::connect(s.addr, Options { name, identity: id, fingerprint: Some(&s.fp), password: None, server_name: None })
+        .await
 }
 
 /// The next event that matches, skipping the rest.
@@ -119,7 +121,7 @@ async fn refuses_a_wrong_fingerprint() {
     let s = start("pinning", false).await;
     let wrong = "00".repeat(32);
     let id = Identity::generate();
-    let opts = Options { name: "A", identity: &id, fingerprint: Some(&wrong), password: None };
+    let opts = Options { name: "A", identity: &id, fingerprint: Some(&wrong), password: None, server_name: None };
     assert!(Client::connect(s.addr, opts).await.is_err());
 }
 
