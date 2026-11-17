@@ -10,6 +10,11 @@ fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// A setting that's set and not blank.
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // plain text when the output goes to `docker logs` rather than a terminal
@@ -23,7 +28,12 @@ async fn main() -> Result<()> {
             .filter(|c| !c.is_empty())
             .collect(),
         max_file: env("BANSHEE_MAX_FILE_MB", "500").parse::<u64>().context("BANSHEE_MAX_FILE_MB")? * 1_000_000,
-        acme: match std::env::var("BANSHEE_DOMAIN").ok().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+        tls_files: match (var("BANSHEE_TLS_CERT"), var("BANSHEE_TLS_KEY")) {
+            (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+            (None, None) => None,
+            _ => anyhow::bail!("BANSHEE_TLS_CERT and BANSHEE_TLS_KEY go together"),
+        },
+        acme: match var("BANSHEE_DOMAIN") {
             Some(domain) => Some(AcmeConfig {
                 domain,
                 email: std::env::var("BANSHEE_ACME_EMAIL").ok().filter(|e| !e.trim().is_empty()),

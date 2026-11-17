@@ -35,6 +35,7 @@ async fn start(name: &str, keep: bool) -> Running {
         channels: vec!["Lobby".into(), "Games".into()],
         max_file: 1_000_000,
         acme: None,
+        tls_files: None,
     })
     .unwrap();
     let (addr, fp, token) = (server.local_addr().unwrap(), server.fingerprint().to_string(), server.admin_token());

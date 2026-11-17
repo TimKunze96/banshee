@@ -53,6 +53,13 @@ just `banshee://voice.example.com`.
 If it can't get one, the log says so and it retries every hour; until then it
 uses its own certificate.
 
+When something else on the machine already answers on TCP 80 (a reverse proxy
+like Traefik or Caddy), let it get the certificate and hand Banshee the PEM
+files instead: `BANSHEE_TLS_CERT` and `BANSHEE_TLS_KEY`. Banshee checks them
+every few minutes and picks up a renewed certificate without a restart. Keep
+`BANSHEE_DOMAIN` set for the log line; Banshee then doesn't ask Let's Encrypt
+itself.
+
 ### Without a domain
 
 The server makes its own certificate on first start and keeps it in the data
