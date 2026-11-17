@@ -108,8 +108,8 @@ pub struct StreamInfo {
     pub layers: Vec<Layer>,
     /// The stream carries sound.
     pub audio: bool,
-    /// Filled in by the server.
-    pub viewers: u32,
+    /// Who watches, filled in by the server.
+    pub viewers: Vec<UserId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

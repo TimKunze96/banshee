@@ -423,7 +423,7 @@ async fn offline_messages_and_the_log() {
 fn layers(n: usize) -> StreamInfo {
     let all = [(1920, 1080), (1280, 720), (640, 360)];
     let layers = all[..n].iter().map(|&(width, height)| Layer { width, height, fps: 30, bitrate: 1_000_000 }).collect();
-    StreamInfo { layers, audio: true, viewers: 0 }
+    StreamInfo { layers, audio: true, viewers: Vec::new() }
 }
 
 fn video(track: u8, keyframe: bool, data: &[u8]) -> Packet {
@@ -458,8 +458,11 @@ async fn screen_sharing() {
     // Auto starts on the second layer
     b.send(ClientMsg::Watch { user: a_id, quality: Quality::Auto });
     wait_for(&mut a, keyframe_for(1)).await;
-    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers == 1)))
-        .await;
+    wait_for(
+        &mut b,
+        |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers.len() == 1)),
+    )
+    .await;
     let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
     assert_eq!(watching.from, a_id);
 
@@ -491,8 +494,11 @@ async fn screen_sharing() {
     let games = b.channels[1].id;
     b.join(games);
     assert_eq!(next_packet(&mut watching).await, None);
-    wait_for(&mut a, |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers == 0)))
-        .await;
+    wait_for(
+        &mut a,
+        |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers.is_empty())),
+    )
+    .await;
     b.send(ClientMsg::Watch { user: a_id, quality: Quality::Auto });
     wait_for(&mut b, |e| matches!(e, ServerMsg::Error { message } if message.contains("own channel"))).await;
     b.join(a.channels[0].id);

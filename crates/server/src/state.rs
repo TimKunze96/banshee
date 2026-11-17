@@ -1016,7 +1016,7 @@ impl State {
         if info.layers.is_empty() || info.layers.len() > video::MAX_LAYERS {
             return Err(format!("streams need 1 to {} layers", video::MAX_LAYERS));
         }
-        info.viewers = 0;
+        info.viewers = Vec::new();
         self.update(id, |u| u.stream = Some(info))?;
         self.log(format!("{} started sharing their screen", self.name(id)));
         Ok(())
@@ -1051,12 +1051,13 @@ impl State {
         Ok(())
     }
 
-    /// Keep the viewer count people see up to date.
+    /// Keep the list of viewers people see up to date.
     fn count_viewers(&mut self, user: UserId) {
         let Some(p) = self.users.get(&user) else { return };
-        let n = p.watchers.len() as u32;
-        if p.user.stream.as_ref().is_some_and(|s| s.viewers != n) {
-            let _ = self.update(user, |u| u.stream.as_mut().unwrap().viewers = n);
+        let mut viewers: Vec<UserId> = p.watchers.keys().copied().collect();
+        viewers.sort();
+        if p.user.stream.as_ref().is_some_and(|s| s.viewers != viewers) {
+            let _ = self.update(user, |u| u.stream.as_mut().unwrap().viewers = viewers);
         }
     }
 
