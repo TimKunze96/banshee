@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use banshee_client::{
-    ChannelEdit, ChatTarget, Client, ClientMsg, Identity, Leave, NewChannel, Options, Request, ServerMsg, Whisper,
+    AUDIO, ChannelEdit, ChatTarget, Client, ClientMsg, Identity, Layer, Leave, NewChannel, Options, Packet, Quality,
+    Request, ServerMsg, StreamInfo, Whisper,
 };
 use banshee_server::{Config, Server};
 use tokio::io::AsyncReadExt;
@@ -33,6 +34,7 @@ async fn start(name: &str, keep: bool) -> Running {
         data_dir: dir,
         channels: vec!["Lobby".into(), "Games".into()],
         max_file: 1_000_000,
+        acme: None,
     })
     .unwrap();
     let (addr, fp, token) = (server.local_addr().unwrap(), server.fingerprint().to_string(), server.admin_token());
@@ -40,7 +42,8 @@ async fn start(name: &str, keep: bool) -> Running {
 }
 
 async fn connect(s: &Running, name: &str, id: &Identity) -> anyhow::Result<Client> {
-    Client::connect(s.addr, Options { name, identity: id, fingerprint: Some(&s.fp), password: None }).await
+    Client::connect(s.addr, Options { name, identity: id, fingerprint: Some(&s.fp), password: None, server_name: None })
+        .await
 }
 
 /// The next event that matches, skipping the rest.
@@ -118,7 +121,7 @@ async fn refuses_a_wrong_fingerprint() {
     let s = start("pinning", false).await;
     let wrong = "00".repeat(32);
     let id = Identity::generate();
-    let opts = Options { name: "A", identity: &id, fingerprint: Some(&wrong), password: None };
+    let opts = Options { name: "A", identity: &id, fingerprint: Some(&wrong), password: None, server_name: None };
     assert!(Client::connect(s.addr, opts).await.is_err());
 }
 
@@ -417,4 +420,131 @@ async fn offline_messages_and_the_log() {
     let text: Vec<&str> = log.iter().map(|l| l.text.as_str()).collect();
     assert!(text.iter().any(|t| t.starts_with("B joined")), "{text:?}");
     assert!(text.contains(&"Admin redeemed a token for Admin"), "{text:?}");
+}
+
+fn layers(n: usize) -> StreamInfo {
+    let all = [(1920, 1080), (1280, 720), (640, 360)];
+    let layers = all[..n].iter().map(|&(width, height)| Layer { width, height, fps: 30, bitrate: 1_000_000 }).collect();
+    StreamInfo { layers, audio: true, viewers: Vec::new() }
+}
+
+fn video(track: u8, keyframe: bool, data: &[u8]) -> Packet {
+    Packet { track, keyframe, data: data.to_vec() }
+}
+
+async fn next_packet(w: &mut banshee_client::Watching) -> Option<Packet> {
+    tokio::time::timeout(WAIT, w.packet()).await.unwrap().unwrap()
+}
+
+fn keyframe_for(layer: u8) -> impl Fn(&ServerMsg) -> bool {
+    move |e| matches!(e, ServerMsg::SendKeyframe { layer: l } if *l == layer)
+}
+
+#[tokio::test]
+async fn screen_sharing() {
+    let s = start("screens", false).await;
+    let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
+    let mut b = connect(&s, "B", &Identity::generate()).await.unwrap();
+    let (a_id, b_id) = (a.you, b.you);
+
+    // nothing to watch yet
+    b.send(ClientMsg::Watch { user: a_id, quality: Quality::Auto });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Error { .. })).await;
+
+    let mut share = a.video().share(&layers(3)).await.unwrap();
+    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.id == a_id && u.stream == Some(layers(3)))).await;
+    // a second share at once is refused
+    let _second = a.video().share(&layers(1)).await.unwrap();
+    wait_for(&mut a, |e| matches!(e, ServerMsg::Error { message } if message.contains("already"))).await;
+
+    // Auto starts on the second layer
+    b.send(ClientMsg::Watch { user: a_id, quality: Quality::Auto });
+    wait_for(&mut a, keyframe_for(1)).await;
+    wait_for(
+        &mut b,
+        |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers.len() == 1)),
+    )
+    .await;
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    assert_eq!(watching.from, a_id);
+
+    // watchers start at a keyframe of their layer, and get the sound
+    share.send(&video(1, false, b"p0")).await.unwrap();
+    share.send(&video(0, true, b"big")).await.unwrap();
+    share.send(&video(1, true, b"key")).await.unwrap();
+    share.send(&video(2, true, b"small")).await.unwrap();
+    share.send(&Packet { track: AUDIO, keyframe: false, data: b"opus".to_vec() }).await.unwrap();
+    share.send(&video(1, false, b"p1")).await.unwrap();
+    assert_eq!(next_packet(&mut watching).await, Some(video(1, true, b"key")));
+    assert_eq!(next_packet(&mut watching).await.unwrap().track, AUDIO);
+    assert_eq!(next_packet(&mut watching).await, Some(video(1, false, b"p1")));
+
+    // picking a layer switches at its next keyframe
+    b.send(ClientMsg::SetQuality { user: a_id, quality: Quality::Layer(2) });
+    wait_for(&mut a, keyframe_for(2)).await;
+    share.send(&video(1, false, b"p2")).await.unwrap();
+    share.send(&video(2, true, b"small key")).await.unwrap();
+    assert_eq!(next_packet(&mut watching).await, Some(video(1, false, b"p2")));
+    assert_eq!(next_packet(&mut watching).await, Some(video(2, true, b"small key")));
+
+    // a broken picture asks for a keyframe (at most one a second)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    b.send(ClientMsg::WantKeyframe { user: a_id });
+    wait_for(&mut a, keyframe_for(2)).await;
+
+    // leaving the channel ends watching
+    let games = b.channels[1].id;
+    b.join(games);
+    assert_eq!(next_packet(&mut watching).await, None);
+    wait_for(
+        &mut a,
+        |e| matches!(e, ServerMsg::UserChanged(u) if u.stream.as_ref().is_some_and(|s| s.viewers.is_empty())),
+    )
+    .await;
+    b.send(ClientMsg::Watch { user: a_id, quality: Quality::Auto });
+    wait_for(&mut b, |e| matches!(e, ServerMsg::Error { message } if message.contains("own channel"))).await;
+    b.join(a.channels[0].id);
+    wait_for(&mut b, moved(b_id, a.channels[0].id)).await;
+
+    // watching again replaces the stream
+    b.send(ClientMsg::Watch { user: a_id, quality: Quality::Layer(0) });
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    b.send(ClientMsg::Watch { user: a_id, quality: Quality::Layer(0) });
+    assert_eq!(next_packet(&mut watching).await, None);
+    let mut watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+    share.send(&video(0, true, b"key3")).await.unwrap();
+    assert_eq!(next_packet(&mut watching).await, Some(video(0, true, b"key3")));
+
+    // stopping ends it for everyone
+    share.stop();
+    assert_eq!(next_packet(&mut watching).await, None);
+    wait_for(&mut b, |e| matches!(e, ServerMsg::UserChanged(u) if u.id == a_id && u.stream.is_none())).await;
+}
+
+/// A watcher who falls behind moves down a layer; after a while without
+/// trouble they try the better one again.
+#[tokio::test]
+async fn auto_quality() {
+    let s = start("auto-quality", false).await;
+    let mut a = connect(&s, "A", &Identity::generate()).await.unwrap();
+    let b = connect(&s, "B", &Identity::generate()).await.unwrap();
+    let mut share = a.video().share(&layers(3)).await.unwrap();
+    b.send(ClientMsg::Watch { user: a.you, quality: Quality::Auto });
+    wait_for(&mut a, keyframe_for(1)).await;
+    let watching = tokio::time::timeout(WAIT, b.video().next()).await.unwrap().unwrap();
+
+    // B doesn't read: its stream fills up, and the server asks for the smaller layer
+    let big = vec![7u8; 256 * 1024];
+    share.send(&video(1, true, &big)).await.unwrap();
+    let pushing = async {
+        loop {
+            share.send(&video(1, false, &big)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        _ = pushing => unreachable!(),
+        _ = wait_for(&mut a, keyframe_for(2)) => {}
+    }
+    drop(watching);
 }

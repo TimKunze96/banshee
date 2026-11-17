@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use banshee_server::acme::AcmeConfig;
 use banshee_server::{Config, Server};
 use tracing::info;
 
@@ -22,9 +23,28 @@ async fn main() -> Result<()> {
             .filter(|c| !c.is_empty())
             .collect(),
         max_file: env("BANSHEE_MAX_FILE_MB", "500").parse::<u64>().context("BANSHEE_MAX_FILE_MB")? * 1_000_000,
+        acme: match std::env::var("BANSHEE_DOMAIN").ok().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+            Some(domain) => Some(AcmeConfig {
+                domain,
+                email: std::env::var("BANSHEE_ACME_EMAIL").ok().filter(|e| !e.trim().is_empty()),
+                http: env("BANSHEE_ACME_HTTP", "0.0.0.0:8080").parse().context("BANSHEE_ACME_HTTP")?,
+                staging: env("BANSHEE_ACME_STAGING", "") == "1",
+                directory: std::env::var("BANSHEE_ACME_DIRECTORY").ok(),
+                directory_root: std::env::var("BANSHEE_ACME_DIRECTORY_ROOT").ok().map(PathBuf::from),
+            }),
+            None => None,
+        },
     };
+    let domain = config.acme.as_ref().map(|a| a.domain.clone());
     let server = Server::bind(config)?;
-    info!(addr = %server.local_addr()?, fingerprint = server.fingerprint(), "listening");
+    match &domain {
+        Some(domain) => info!(addr = %server.local_addr()?, "listening; connect with banshee://{domain}"),
+        None => info!(
+            addr = %server.local_addr()?,
+            "listening; connect with banshee://<address>#{}",
+            server.fingerprint()
+        ),
+    }
     if let Some(token) = server.admin_token() {
         info!("redeem this token to become admin: {token}");
     }

@@ -1,8 +1,10 @@
 //! The Banshee server: one QUIC endpoint, a channel tree, roles and
 //! moderation, text chat, and voice relayed to whoever should hear it.
 
+pub mod acme;
 mod db;
 mod files;
+mod screens;
 mod state;
 
 use std::net::SocketAddr;
@@ -13,8 +15,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use banshee_proto::transfer::{MAX_AVATAR, Reply, Request};
 use banshee_proto::{
-    ALPN, ClientMsg, FrameError, IDENTITY_LABEL, Leave, PROTOCOL_VERSION, Perm, ServerMsg, UserId, read_msg, voice,
-    write_msg,
+    ALPN, ClientMsg, FrameError, IDENTITY_LABEL, Leave, PROTOCOL_VERSION, Perm, ServerMsg, UserId, read_msg, video,
+    voice, write_msg,
 };
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -36,11 +38,15 @@ pub struct Config {
     pub channels: Vec<String>,
     /// Biggest file people can upload, in bytes.
     pub max_file: u64,
+    /// A Let's Encrypt certificate for a domain, instead of the self-signed one.
+    pub acme: Option<acme::AcmeConfig>,
 }
 
 pub struct Server {
     endpoint: quinn::Endpoint,
     fingerprint: String,
+    /// Keeps the Let's Encrypt certificate fresh, started with `run`.
+    acme: Option<acme::Renewal>,
     state: Arc<Mutex<State>>,
     max_file: u64,
 }
@@ -52,10 +58,18 @@ impl Server {
         let fingerprint = fingerprint(&cert);
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        // the Let's Encrypt one when we have it; self-signed until then
+        let saved = config.acme.as_ref().and_then(|_| acme::load(&config.data_dir, &provider));
+        let issued = saved.as_ref().map(|(_, t)| *t);
+        let first = match saved {
+            Some((key, _)) => key,
+            None => acme::certified(vec![cert], key, &provider)?,
+        };
+        let certs = Arc::new(acme::Certs::new(first));
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
-            .with_single_cert(vec![cert], key)?;
+            .with_cert_resolver(certs.clone());
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
         let mut transport = quinn::TransportConfig::default();
@@ -64,8 +78,10 @@ impl Server {
 
         let endpoint =
             quinn::Endpoint::server(server_config, config.bind).with_context(|| format!("binding {}", config.bind))?;
-        let state = Arc::new(Mutex::new(State::new(db, config.data_dir)?));
-        Ok(Self { endpoint, fingerprint, state, max_file: config.max_file })
+        let state = Arc::new(Mutex::new(State::new(db, config.data_dir.clone())?));
+        let acme =
+            config.acme.map(|a| acme::Renewal { config: a, data: config.data_dir.clone(), certs, provider, issued });
+        Ok(Self { endpoint, fingerprint, acme, state, max_file: config.max_file })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -83,7 +99,10 @@ impl Server {
     }
 
     /// Accept connections until the endpoint closes.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
+        if let Some(renewal) = self.acme.take() {
+            tokio::spawn(acme::run(renewal));
+        }
         while let Some(incoming) = self.endpoint.accept().await {
             let state = self.state.clone();
             let max_file = self.max_file;
@@ -168,11 +187,26 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>, max_file: u
         #[allow(unreachable_code)]
         anyhow::Ok(Leave::Quit)
     };
+    // screen sharing
+    let shares = async {
+        loop {
+            let recv = conn.accept_uni().await?;
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = share(&state, id, recv).await {
+                    info!(id, "screen share ended: {e:#}");
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(Leave::Quit)
+    };
     let result = tokio::select! {
         r = writer => r,
         r = control => r,
         r = voice => r,
         r = streams => r,
+        r = shares => r,
     };
     // the client closing shows up as an error on whichever read noticed first
     let said_bye = matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(_)));
@@ -183,6 +217,34 @@ async fn handle(incoming: quinn::Incoming, state: Arc<Mutex<State>>, max_file: u
     };
     state.lock().unwrap().depart(id, reason);
     result.map(|_| ())
+}
+
+/// Someone's screen, until they finish the stream (see `banshee_proto::video`).
+async fn share(state: &Mutex<State>, id: UserId, mut recv: quinn::RecvStream) -> Result<()> {
+    let mut kind = [0u8];
+    recv.read_exact(&mut kind).await?;
+    if kind[0] != video::KIND {
+        let _ = recv.stop(0u32.into());
+        bail!("unknown stream kind {}", kind[0]);
+    }
+    let info = tokio::time::timeout(Duration::from_secs(10), read_msg::<_, banshee_proto::StreamInfo>(&mut recv))
+        .await
+        .context("no stream info")??;
+    let started = state.lock().unwrap().start_stream(id, info);
+    if let Err(message) = started {
+        state.lock().unwrap().send(id, ServerMsg::Error { message });
+        let _ = recv.stop(0u32.into());
+        return Ok(());
+    }
+    let result = async {
+        while let Some(packet) = video::read(&mut recv).await? {
+            state.lock().unwrap().relay_packet(id, packet);
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    state.lock().unwrap().stop_stream(id);
+    result
 }
 
 /// One file transfer (see `banshee_proto::transfer`).

@@ -3,7 +3,8 @@
 //! A client opens one QUIC connection. The first bidirectional stream carries
 //! control messages ([`ClientMsg`] up, [`ServerMsg`] down), each framed as a
 //! little-endian `u32` length followed by the postcard encoding. Voice goes
-//! as unreliable QUIC datagrams (see [`voice`]).
+//! as unreliable QUIC datagrams (see [`voice`]), screen sharing on
+//! unidirectional streams (see [`video`]).
 //!
 //! People are known by an Ed25519 key. `Hello` carries the public key and a
 //! signature over TLS keying material of this connection (see
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on incompatible changes; the server refuses other versions.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The ALPN both sides agree on.
 pub const ALPN: &[u8] = b"banshee/1";
@@ -96,6 +97,38 @@ pub struct User {
     pub talk_request: Option<String>,
     /// Hash of their picture (fetch it with [`transfer::Request::Avatar`]).
     pub avatar: Option<String>,
+    /// Sharing their screen (watch it with [`ClientMsg::Watch`]).
+    pub stream: Option<StreamInfo>,
+}
+
+/// A shared screen: its quality layers and who watches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamInfo {
+    /// Best first. The sharer encodes each one; every watcher gets one of them.
+    pub layers: Vec<Layer>,
+    /// The stream carries sound.
+    pub audio: bool,
+    /// Who watches, filled in by the server.
+    pub viewers: Vec<UserId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Layer {
+    pub width: u16,
+    pub height: u16,
+    pub fps: u8,
+    /// Bits a second it aims for.
+    pub bitrate: u32,
+}
+
+/// Which layer of a stream a watcher wants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Quality {
+    /// The best one their connection keeps up with (the server decides).
+    #[default]
+    Auto,
+    /// This layer (index into [`StreamInfo::layers`]), or the nearest there is.
+    Layer(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -423,6 +456,25 @@ pub enum ClientMsg {
     ReadLog {
         lines: u32,
     },
+
+    /// Watch someone's screen in our channel. Their frames come on a stream
+    /// the server opens (see [`video`]).
+    Watch {
+        user: UserId,
+        quality: Quality,
+    },
+    /// Change the layer of a stream we watch, without starting over.
+    SetQuality {
+        user: UserId,
+        quality: Quality,
+    },
+    Unwatch {
+        user: UserId,
+    },
+    /// Our picture of their stream broke; ask them for a keyframe.
+    WantKeyframe {
+        user: UserId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +545,11 @@ pub enum ServerMsg {
     },
     Inbox(Vec<OfflineMessage>),
     Log(Vec<LogLine>),
+    /// Someone started watching this layer of our screen or lost the
+    /// picture: send a keyframe on it next.
+    SendKeyframe {
+        layer: u8,
+    },
     /// A request was refused. The connection stays up unless it was `Hello`.
     Error {
         message: String,
@@ -667,5 +724,106 @@ mod tests {
         let key = [0xab; 32];
         assert_eq!(parse_key(&key_hex(&key)), Some(key));
         assert_eq!(parse_key("abc"), None);
+    }
+}
+
+/// Screen sharing. A client shares its screen by opening a unidirectional
+/// stream and writing [`KIND`](video::KIND), then its [`StreamInfo`] (framed
+/// like control messages), then packets; finishing the stream stops sharing.
+/// For each watcher the server opens a unidirectional stream with `KIND`, the
+/// sharer's id (u32 LE), then the packets meant for them: one video layer and
+/// the audio.
+///
+/// A packet is `len (u32 LE) | track | flags | data`. Tracks below
+/// [`AUDIO`](video::AUDIO) are video layers (H.264 Annex B, one frame per
+/// packet); `AUDIO` is Opus (48 kHz stereo, 20 ms per packet). A watcher's
+/// video starts at a keyframe, and layers are switched at keyframes.
+pub mod video {
+    use super::{FrameError, UserId};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    /// First byte of a video stream.
+    pub const KIND: u8 = 1;
+    /// The track of sound packets.
+    pub const AUDIO: u8 = 255;
+    /// The frame can be decoded on its own.
+    pub const KEYFRAME: u8 = 1;
+    /// Biggest packet either side takes.
+    pub const MAX_PACKET: u32 = 8 * 1024 * 1024;
+    /// Most layers a stream can have.
+    pub const MAX_LAYERS: usize = 4;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Packet {
+        pub track: u8,
+        pub keyframe: bool,
+        pub data: Vec<u8>,
+    }
+
+    impl Packet {
+        pub fn is_audio(&self) -> bool {
+            self.track == AUDIO
+        }
+
+        /// As it goes on the wire.
+        pub fn encode(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(6 + self.data.len());
+            out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+            out.push(self.track);
+            out.push(if self.keyframe { KEYFRAME } else { 0 });
+            out.extend_from_slice(&self.data);
+            out
+        }
+    }
+
+    pub async fn write<W: AsyncWrite + Unpin>(w: &mut W, packet: &Packet) -> Result<(), FrameError> {
+        if packet.data.len() > MAX_PACKET as usize {
+            return Err(FrameError::TooBig(packet.data.len() as u32));
+        }
+        w.write_all(&packet.encode()).await?;
+        Ok(())
+    }
+
+    /// The next packet; None when the stream ended between packets.
+    pub async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Packet>, FrameError> {
+        let mut head = [0u8; 6];
+        match r.read_exact(&mut head[..1]).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        r.read_exact(&mut head[1..]).await?;
+        let len = u32::from_le_bytes(head[..4].try_into().unwrap());
+        if len > MAX_PACKET {
+            return Err(FrameError::TooBig(len));
+        }
+        let mut data = vec![0u8; len as usize];
+        r.read_exact(&mut data).await?;
+        Ok(Some(Packet { track: head[4], keyframe: head[5] & KEYFRAME != 0, data }))
+    }
+
+    /// Start of the stream the server opens to a watcher.
+    pub fn watcher_header(from: UserId) -> [u8; 5] {
+        let mut out = [KIND, 0, 0, 0, 0];
+        out[1..].copy_from_slice(&from.to_le_bytes());
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn packets() {
+            let key = Packet { track: 0, keyframe: true, data: b"key".to_vec() };
+            let sound = Packet { track: AUDIO, keyframe: false, data: vec![] };
+            let mut buf = Vec::new();
+            write(&mut buf, &key).await.unwrap();
+            write(&mut buf, &sound).await.unwrap();
+            let mut r = &buf[..];
+            assert_eq!(read(&mut r).await.unwrap(), Some(key));
+            assert_eq!(read(&mut r).await.unwrap(), Some(sound));
+            assert_eq!(read(&mut r).await.unwrap(), None);
+        }
     }
 }
